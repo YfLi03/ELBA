@@ -3,11 +3,15 @@
 #include "Bloom.hpp"
 #include "Logger.hpp"
 #include "DnaSeq.hpp"
+#include "MPITimer.hpp"
+#include "ParadisSort.hpp"
 #include <cstring>
 #include <numeric>
 #include <algorithm>
 #include <iomanip>
 #include <cmath>
+#include <mpi.h>
+#include <omp.h>
 
 #if USE_BLOOM == 1
 static Bloom *bm = nullptr;
@@ -18,6 +22,8 @@ static_assert(USE_BLOOM == 0);
 std::unique_ptr<KmerCountMap>
 get_kmer_count_map_keys(const DnaBuffer& myreads, std::shared_ptr<CommGrid> commgrid)
 {
+    MPI_Comm comm = MPI_COMM_WORLD;
+
     int myrank = commgrid->GetRank();
     int nprocs = commgrid->GetSize();
 
@@ -39,6 +45,9 @@ get_kmer_count_map_keys(const DnaBuffer& myreads, std::shared_ptr<CommGrid> comm
     kmermap = new KmerCountMap;
     numreads = myreads.size();
 
+    MPITimer timer(comm);
+    timer.start();
+
     /*
      * Estimate the number of distinct k-mers in my local FASTA partition.
      */
@@ -46,11 +55,14 @@ get_kmer_count_map_keys(const DnaBuffer& myreads, std::shared_ptr<CommGrid> comm
     ForeachKmer(myreads, estimator);
     mycardinality = hll.estimate();
 
+    timer.stop_and_log("K-mer cardinality estimate");
+
     #if LOG_LEVEL >= 2
     logger() << std::setprecision(3) << std::fixed << mycardinality << " k-mers";
     logger.Flush("K-mer cardinality estimate");
     #endif
 
+    timer.start();
     /*
      * Estimate the number of distinct k-mers in the entire FASTA
      * by merging Hyperloglog counters from each processor.
@@ -59,6 +71,7 @@ get_kmer_count_map_keys(const DnaBuffer& myreads, std::shared_ptr<CommGrid> comm
     cardinality = hll.estimate();
 
     avgcardinality = static_cast<size_t>(std::ceil(cardinality / nprocs));
+    timer.stop_and_log("K-mer cardinality merge");
 
     #if LOG_LEVEL >= 2
     rootlog << "global 'column' k-mer cardinality (merging all " << nprocs << " procesors results) is " << std::setprecision(3) << std::fixed << cardinality << ", or an average of " << avgcardinality << " per processor" << std::endl;
@@ -96,12 +109,16 @@ get_kmer_count_map_keys(const DnaBuffer& myreads, std::shared_ptr<CommGrid> comm
          * immediately queried against a Bloom filter and hash table keyed
          * by the distinct k-mer.
          */
+
+        timer.start();
         KmerPartitionHandler partitioner(kmerbuckets);
         ForeachKmer(myreads, partitioner, batch_state);
+        timer.stop_and_log("K-mer partitioning");
 
         /*
          * ALLTOALL send counts: Number of k-mers my processor is sending to each other processor.
          */
+        timer.start();
         std::transform(kmerbuckets.cbegin(), kmerbuckets.cend(), sendcnt.begin(), [](const auto& bucket) { return bucket.size() * TKmer::NBYTES; });
 
         /*
@@ -149,12 +166,111 @@ get_kmer_count_map_keys(const DnaBuffer& myreads, std::shared_ptr<CommGrid> comm
          * Communicate locally parsed k-mers to other processors in ALLTOALL fashion.
          */
         MPI_ALLTOALLV(sendbuf.data(), sendcnt.data(), sdispls.data(), MPI_BYTE, recvbuf.data(), recvcnt.data(), rdispls.data(), MPI_BYTE, commgrid->GetWorld());
-
+        timer.stop_and_log("K-mer exchange");
         /*
          * Unpack incoming k-mers in a streaming fashion.
          */
+        timer.start();
         numkmerseeds = totrecv / TKmer::NBYTES;
         uint8_t *src = recvbuf.data();
+
+        // We're doing experiements. Suppose we use 8 Bytes for storing a Kmer (K < 32)
+        // This code will NOT work for K > 32, remember to modify it !!!
+        assert(TKmer::NBYTES == 8);
+        uint64_t *src64 = reinterpret_cast<uint64_t*>(src);
+        uint64_t *src64_end = src64 + numkmerseeds;
+
+#define NUM_OMP_THREADS 16
+        omp_set_num_threads(NUM_OMP_THREADS);
+
+        logger() << "numkmerseeds: " << numkmerseeds << std::endl;
+        logger.Flush("beggining PARADIS");
+
+        paradis::sort<uint64_t>(src64, src64_end, NUM_OMP_THREADS);
+
+        timer.stop_and_log("Shared memory parallel K-mer sorting");
+        timer.start();
+
+        size_t start_idx[NUM_OMP_THREADS + 1];
+        
+        // finding the starting idx for each thread
+        #pragma omp parallel
+        {
+            int tid = omp_get_thread_num();
+            int nthreads = omp_get_num_threads();
+
+            if ( tid == 0 ){
+                start_idx[0] = 0;
+            } else {
+                size_t idx = tid * (numkmerseeds / nthreads);
+                TKmer last_mer = TKmer(src64 + idx);
+                TKmer cur_mer = TKmer(src64 + idx);
+                while (true) {
+                    cur_mer = TKmer(src64 + idx -1 );
+                    if(cur_mer != last_mer) {
+                        start_idx[tid] = idx;
+                        break;
+                    }
+                    idx--;
+                    last_mer = cur_mer;
+                }
+            }
+        }
+
+        start_idx[NUM_OMP_THREADS] = numkmerseeds;
+        logger()<< "start_idx: "<<std::endl;
+        for (int i = 0; i < NUM_OMP_THREADS + 1; i++) {
+            logger() << start_idx[i] << " ";
+        }
+        logger.Flush("start_idx");
+
+        uint64_t valid_kmer[NUM_OMP_THREADS];
+
+        #pragma omp parallel
+        {
+            int tid = omp_get_thread_num();
+            TKmer last_mer = TKmer(src64 + start_idx[tid]);
+            size_t dst_idx = start_idx[tid];
+            size_t cur_kmer_cnt = 1;
+
+            valid_kmer[tid] = 0;
+
+            for(size_t cur_idx = start_idx[tid] + 1; cur_idx < start_idx[tid + 1]; cur_idx++) {
+                TKmer cur_mer = TKmer(src64 + cur_idx);
+                if (cur_mer == last_mer) {
+                    cur_kmer_cnt++;
+                } else {
+                    if (cur_kmer_cnt >= LOWER_KMER_FREQ && cur_kmer_cnt <= UPPER_KMER_FREQ) {
+                        memcpy(src64 + dst_idx, src64 + cur_idx - 1, TKmer::NBYTES);
+                        dst_idx++;
+                        valid_kmer[tid]++;
+                    }
+                    cur_kmer_cnt = 1;
+                    last_mer = cur_mer;
+                }
+            }
+            // deal with the last kmer
+            if (cur_kmer_cnt >= LOWER_KMER_FREQ && cur_kmer_cnt <= UPPER_KMER_FREQ) {
+                memcpy(src64 + dst_idx, src64 + start_idx[tid + 1] - 1, TKmer::NBYTES);
+                dst_idx++;
+                valid_kmer[tid]++;
+            }
+        }
+
+        logger()<< "valid_kmer: "<<std::endl;
+        for (int i = 0; i < NUM_OMP_THREADS; i++) {
+            logger() << valid_kmer[i] << " ";
+        }
+
+        uint64_t valid_kmer_total = valid_kmer[0];
+        for (int i = 1; i < NUM_OMP_THREADS; i++) {
+            memcpy(src64 + valid_kmer_total, src64 + start_idx[i], valid_kmer[i] * TKmer::NBYTES);
+            valid_kmer_total += valid_kmer[i];
+        }
+
+        
+
+        /*
         for (size_t i = 0; i < numkmerseeds; ++i)
         {
             TKmer mer(src);
@@ -162,7 +278,7 @@ get_kmer_count_map_keys(const DnaBuffer& myreads, std::shared_ptr<CommGrid> comm
 
             /*
              * Check if incoming k-mer is already "inside" the local Bloom filter.
-             */
+             /
             if (bm->Check(mer.GetBytes(), TKmer::NBYTES))
             {
                 /*
@@ -170,9 +286,11 @@ get_kmer_count_map_keys(const DnaBuffer& myreads, std::shared_ptr<CommGrid> comm
                  * inserted into the filter, and therefore is likely not a
                  * singleton k-mer. Insert it into local hash table partition
                  * if it hasn't already been.
-                 */
+                 /
+                
                 if (kmermap->find(mer) == kmermap->end())
                     kmermap->insert({mer, KmerCountEntry({}, {}, 0)});
+                
             }
             else
             {
@@ -181,11 +299,15 @@ get_kmer_count_map_keys(const DnaBuffer& myreads, std::shared_ptr<CommGrid> comm
                  * add it to the Bloom filter. If this k-mer is a singleton,
                  * then we have effectively filtered it away from being
                  * queried on the local hash table.
-                 */
+                 /
                 bm->Add(mer.GetBytes(), TKmer::NBYTES);
             }
         }
+        */
 
+
+
+        timer.stop_and_log("K-mer filtered");
         size_t justsent = (totsend / TKmer::NBYTES);
         size_t justrecv = (totrecv / TKmer::NBYTES);
 

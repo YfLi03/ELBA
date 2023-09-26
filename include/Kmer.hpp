@@ -44,6 +44,9 @@ public:
 
     uint64_t GetHash() const;
     const void* GetBytes() const { return reinterpret_cast<const void*>(longs.data()); }
+    int getByte(int &i) const {
+        return bytes[i];
+    }
 
     void CopyDataInto(void *mem) const { std::memcpy(mem, longs.data(), NBYTES); }
     void CopyDataFrom(const void *mem) { std::memcpy(longs.data(), mem, NBYTES); }
