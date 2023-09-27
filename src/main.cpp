@@ -63,7 +63,7 @@ double bad_read_cutoff = 0.65;
 constexpr int root = 0; /* root process rank */
 
 int parse_cli(int argc, char *argv[]);
-void print_kmer_histogram(const KmerCountMap& kmermap, std::shared_ptr<CommGrid> commgrid);
+void print_kmer_histogram(const KmerList& kmerlist, std::shared_ptr<CommGrid> commgrid);
 void parallel_write_paf(const CT<Overlap>::PSpParMat& R, DistributedFastaData& dfd, char const *pafname);
 void parallel_write_contigs(const std::vector<std::string>& contigs, MPI_Comm comm);
 CT<int64_t>::PDistVec find_contained_reads(const CT<Overlap>::PSpParMat& R);
@@ -188,9 +188,9 @@ int main(int argc, char **argv)
          *       @get_kmer_count_map_values().
          *
          */
-        timer.start();
-        kmermap = get_kmer_count_map_keys(mydna, commgrid);
-        timer.stop_and_log("collecting distinct k-mers");
+        // timer.start();
+        // kmermap = get_kmer_count_map_keys(mydna, commgrid);
+        // timer.stop_and_log("collecting distinct k-mers");
 
         /*
          * Now that every process has its local partition of the distributed k-mer hash table
@@ -221,11 +221,15 @@ int main(int argc, char **argv)
          * hash table mapping reliable k-mers (k-mers that appear within the defined frequency bounds)
          * to their corresponding k-mer count entries.
          */
-        timer.start();
-        get_kmer_count_map_values(mydna, *kmermap, commgrid);
-        timer.stop_and_log("counting recording k-mer seeds");
+        // timer.start();
+        // get_kmer_count_map_values(mydna, *kmermap, commgrid);
+        // timer.stop_and_log("counting recording k-mer seeds");
 
-        print_kmer_histogram(*kmermap, commgrid);
+        std::unique_ptr<KmerList> kmerlist = get_kmer_list(mydna, commgrid);
+
+        print_kmer_histogram(*kmerlist, commgrid);
+
+        // return 0;
 
         /*
          * Now that all the reliable k-mers and their locations have been computed and stored
@@ -256,14 +260,14 @@ int main(int argc, char **argv)
          * is clear by now what @A is.
          */
         timer.start();
-        A = create_kmer_matrix(mydna, *kmermap, commgrid);
+        A = create_kmer_matrix(mydna, *kmerlist, commgrid);
         timer.stop_and_log("creating k-mer matrix");
 
         /*
-         * Once @A has been constructed, we have no more use for the distributed k-mer hash table
+         * Once @A has been constructed, we have no more use for the distributed k-mer list
          * so we release all its memory.
          */
-        kmermap.reset();
+        kmerlist->clear();
 
         /*
          * The SpGEMM overlap detection phase requires both @A and its transpose @AT.
@@ -446,18 +450,32 @@ int parse_cli(int argc, char *argv[])
     return 0;
 }
 
-void print_kmer_histogram(const KmerCountMap& kmermap, std::shared_ptr<CommGrid> commgrid)
+void print_kmer_histogram(const KmerList& kmerlist, std::shared_ptr<CommGrid> commgrid)
 {
+    Logger logger(commgrid);
     #if LOG_LEVEL >= 2
-    int maxcount = std::accumulate(kmermap.cbegin(), kmermap.cend(), 0, [](int cur, const auto& entry) { return std::max(cur, std::get<2>(entry.second)); });
+    int maxcount = std::accumulate(kmerlist.cbegin(), kmerlist.cend(), 0, [](int cur, const auto& entry) { return std::max(cur, std::get<3>(entry)); });
 
     MPI_Allreduce(MPI_IN_PLACE, &maxcount, 1, MPI_INT, MPI_MAX, commgrid->GetWorld());
 
     std::vector<int> histo(maxcount+1, 0);
 
-    for (auto itr = kmermap.cbegin(); itr != kmermap.cend(); ++itr)
+/*
+    for (auto itr = kmerlist.cbegin(); itr != kmerlist.cend(); ++itr)
     {
-        int cnt = std::get<2>(itr->second);
+        int cnt = std::get<3>(*itr);
+        
+        assert(cnt >= 1);
+        histo[cnt]++;
+    }
+    */
+    for(size_t i = 0; i < kmerlist.size(); ++i)
+    {
+        int cnt = std::get<3>(kmerlist[i]);
+        if(cnt < 1){
+            logger()<<i<<" "<<cnt<<" "<<get<0>(kmerlist[i])<<std::endl;
+            logger.Flush("Error");
+        }
         assert(cnt >= 1);
         histo[cnt]++;
     }

@@ -21,11 +21,59 @@ typedef std::tuple<TKmer, ReadId, PosInRead> KmerSeed;
 typedef std::tuple<READIDS, POSITIONS, int> KmerCountEntry;
 typedef std::unordered_map<TKmer, KmerCountEntry> KmerCountMap;
 
+// yfli: just experimenting, this part of code definitely need some refactoring
+
+struct KmerSeedStruct{
+    uint64_t kmer;      // yfli: temporary solution, need to be refactored
+    ReadId readid;
+    PosInRead posinread;
+
+    // KmerSeedStruct(TKmer kmer, ReadId readid, PosInRead posinread) : kmer(kmer), readid(readid), posinread(posinread) {};
+    KmerSeedStruct(uint64_t* kmer_addr, ReadId readid, PosInRead posinread) : kmer(*kmer_addr), readid(readid), posinread(posinread) {};
+    KmerSeedStruct(const KmerSeedStruct& o) : kmer(o.kmer), readid(o.readid), posinread(o.posinread) {};
+    KmerSeedStruct() {};
+
+    long long GetByte(int &i) const
+    {
+        return (kmer >> (8*i)) & 0xff;
+    }
+
+    bool operator<(const KmerSeedStruct& o) const
+    {
+        return kmer < o.kmer;
+    }
+
+    bool operator==(const KmerSeedStruct& o) const
+    {
+        return kmer == o.kmer;
+    }
+
+    bool operator!=(const KmerSeedStruct& o) const
+    {
+        return kmer != o.kmer;
+    }
+
+    KmerSeedStruct& operator=(const KmerSeedStruct& o)
+    {
+        kmer = o.kmer;
+        readid = o.readid;
+        posinread = o.posinread;
+        return *this;
+    }
+};
+
+// used in the radix sort approach
+typedef std::tuple<TKmer, READIDS, POSITIONS, int> KmerListEntry;
+typedef std::vector<KmerListEntry> KmerList;
+
 std::unique_ptr<CT<PosInRead>::PSpParMat>
-create_kmer_matrix(const DnaBuffer& myreads, const KmerCountMap& kmermap, std::shared_ptr<CommGrid> commgrid);
+create_kmer_matrix(const DnaBuffer& myreads, const KmerList& kmerlist, std::shared_ptr<CommGrid> commgrid);
 
 std::unique_ptr<KmerCountMap>
 get_kmer_count_map_keys(const DnaBuffer& myreads, std::shared_ptr<CommGrid> commgrid);
+
+std::unique_ptr<KmerList>
+get_kmer_list(const DnaBuffer& myreads, std::shared_ptr<CommGrid> commgrid);
 
 void get_kmer_count_map_values(const DnaBuffer& myreads, KmerCountMap& kmermap, std::shared_ptr<CommGrid> commgrid);
 int GetKmerOwner(const TKmer& kmer, int nprocs);

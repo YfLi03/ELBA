@@ -33,8 +33,8 @@ template <typename T> inline void swap(T *a, T *b) {
 template <typename T> inline size_t size(T *a, T *b) { return b - a; }
 } // namespace sort_utils
 
-template <typename T> long long determineDigitBucket(long long stage, T num) {
-  long long result = ((num >> (RADIX_BITS * stage)) & kRadixMask);
+template <typename T> long long determineDigitBucket(int stage, T num) {
+  long long result = num.GetByte(stage);
   return result;
 }
 
@@ -209,8 +209,10 @@ inline void radix_sort_par(T *s, T *t, T *begin_itr, long long processes = 1) {
 }
 
 template <typename T> void sort(T *begin, T *end, size_t thread_count) {
-  const size_t vsize = sizeof(T);
-  radix_sort_par<vsize - 1>(begin, end, begin, thread_count);
+  
+  radix_sort_par<7>(begin, end, begin, thread_count);
+// yfli: this is absolutely experimental, wrong for most cases
+
 }
 
 template <> void sort<float>(float *begin, float *end, size_t thread_count) {}

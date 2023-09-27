@@ -186,7 +186,7 @@ get_kmer_count_map_keys(const DnaBuffer& myreads, std::shared_ptr<CommGrid> comm
         logger() << "numkmerseeds: " << numkmerseeds << std::endl;
         logger.Flush("beggining PARADIS");
 
-        paradis::sort<uint64_t>(src64, src64_end, NUM_OMP_THREADS);
+        // paradis::sort<uint64_t>(src64, src64_end, NUM_OMP_THREADS);
 
         timer.stop_and_log("Shared memory parallel K-mer sorting");
         timer.start();
@@ -324,6 +324,7 @@ get_kmer_count_map_keys(const DnaBuffer& myreads, std::shared_ptr<CommGrid> comm
 
     return std::unique_ptr<KmerCountMap>(kmermap);
 }
+
 
 void get_kmer_count_map_values(const DnaBuffer& myreads, KmerCountMap& kmermap, std::shared_ptr<CommGrid> commgrid)
 {
@@ -471,6 +472,285 @@ void get_kmer_count_map_values(const DnaBuffer& myreads, KmerCountMap& kmermap, 
     #endif
 }
 
+std::unique_ptr<KmerList>
+get_kmer_list(const DnaBuffer& myreads, std::shared_ptr<CommGrid> commgrid)
+{
+    MPI_Comm comm = MPI_COMM_WORLD;
+
+    int myrank = commgrid->GetRank();
+    int nprocs = commgrid->GetSize();
+
+ // KmerCountMap *kmermap;                                         /* Received k-mers will be stored in this local hash table */
+    HyperLogLog hll;                                               /* HyperLogLog counter initialized with 12 bits as default */
+    size_t numreads = myreads.size();                              /* Number of locally stored reads */
+    size_t avgcardinality;                                         /* Average estimate for number of distinct k-mers per procesor (via Hyperloglog)*/
+    double cardinality;                                            /* Total estimate for number of distinct k-mers in dataset (via Hyperloglog) */
+    double mycardinality;                                          /* Local estimate for number of distinct k-mers originating on my processor (via Hyperloglog) */
+    std::vector<std::vector<TKmer>> kmerbuckets(nprocs);           /* My processor's outgoing k-mer seed buckets, one for each destination processor */
+
+                            /* My processor's total number of send and receive bytes */
+    Logger logger(commgrid);
+    std::ostringstream rootlog;
+
+    MPITimer timer(comm);
+
+    timer.start();
+
+ //   kmermap = new KmerCountMap;
+    size_t readoffset = numreads;                                   // yfli: not sure if we need this initial value
+    MPI_Exscan(&numreads, &readoffset, 1, MPI_SIZE_T, MPI_SUM, commgrid->GetWorld());
+    if (!myrank) readoffset = 0;
+
+    std::vector<std::vector<KmerSeed>> kmerseeds(nprocs);
+    KmerParserHandler parser(kmerseeds, static_cast<ReadId>(readoffset));   
+    ForeachKmer(myreads, parser);                                   // yfli: maybe this need to be parallized
+    timer.stop_and_log("Local K-mer parsing");
+    timer.start();
+
+    std::vector<MPI_Count_type> sendcnt(nprocs), recvcnt(nprocs);
+    std::vector<MPI_Displ_type> sdispls(nprocs), rdispls(nprocs);
+
+    constexpr size_t seedbytes = TKmer::NBYTES + sizeof(ReadId) + sizeof(PosInRead);
+
+    #if LOG_LEVEL >= 2
+    logger() << std::setprecision(4) << "sending 'row' k-mers to each processor in this amount (megabytes): {";
+    #endif
+
+    for (int i = 0; i < nprocs; ++i)
+    {
+        sendcnt[i] = kmerseeds[i].size() * seedbytes;
+
+        #if LOG_LEVEL >= 2
+        logger() << (static_cast<double>(sendcnt[i]) / (1024 * 1024)) << ",";
+        #endif
+    }
+
+    #if LOG_LEVEL >= 2
+    logger() << "}";
+    logger.Flush("K-mer exchange sendcounts:");
+    #endif
+
+    // exchange the send/recv cnt information to prepare for data transfer
+    MPI_ALLTOALL(sendcnt.data(), 1, MPI_COUNT_TYPE, recvcnt.data(), 1, MPI_COUNT_TYPE, commgrid->GetWorld());
+
+    sdispls.front() = rdispls.front() = 0;
+    std::partial_sum(sendcnt.begin(), sendcnt.end()-1, sdispls.begin()+1);
+    std::partial_sum(recvcnt.begin(), recvcnt.end()-1, rdispls.begin()+1);
+
+    size_t totsend = std::accumulate(sendcnt.begin(), sendcnt.end(), 0);
+    size_t totrecv = std::accumulate(recvcnt.begin(), recvcnt.end(), 0);
+
+    // copying data to the sendbuf
+    // yfli: maybe these memcpy can be combined into fewer operations by adjusting the data structure
+    std::vector<uint8_t> sendbuf(totsend, 0);
+
+    for (int i = 0; i < nprocs; ++i)
+    {
+        assert(kmerseeds[i].size() == (sendcnt[i] / seedbytes));
+        uint8_t *addrs2fill = sendbuf.data() + sdispls[i];
+        for (MPI_Count_type j = 0; j < kmerseeds[i].size(); ++j)
+        {
+            auto& seeditr = kmerseeds[i][j];
+            TKmer kmer = std::get<0>(seeditr);
+            ReadId readid = std::get<1>(seeditr);
+            PosInRead pos = std::get<2>(seeditr);
+            memcpy(addrs2fill, kmer.GetBytes(), TKmer::NBYTES);
+            memcpy(addrs2fill + TKmer::NBYTES, &readid, sizeof(ReadId));
+            memcpy(addrs2fill + TKmer::NBYTES + sizeof(ReadId), &pos, sizeof(PosInRead));
+            addrs2fill += seedbytes;
+        }
+        kmerseeds[i].clear();
+    }
+
+    std::vector<uint8_t> recvbuf(totrecv, 0);
+    MPI_ALLTOALLV(sendbuf.data(), sendcnt.data(), sdispls.data(), MPI_BYTE, recvbuf.data(), recvcnt.data(), rdispls.data(), MPI_BYTE, commgrid->GetWorld());
+    timer.stop_and_log("K-mer exchange");
+    timer.start();
+
+    size_t numkmerseeds = totrecv / seedbytes;
+
+    #if LOG_LEVEL >= 2
+    logger() << "received a total of " << numkmerseeds << " 'row' k-mers in second ALLTOALL exchange";
+    logger.Flush("K-mers received:");
+    #endif
+
+    uint8_t *addrs2read = recvbuf.data();
+    std::vector<KmerSeedStruct> recv_kmerseeds(numkmerseeds);
+
+    // yfli: maybe we need to parallize this
+    for (size_t i = 0; i < numkmerseeds; i++ ) 
+    {
+        recv_kmerseeds.push_back(KmerSeedStruct());
+
+        ReadId readid = *((ReadId*)(addrs2read + TKmer::NBYTES));
+        PosInRead pos = *((PosInRead*)(addrs2read + TKmer::NBYTES + sizeof(ReadId)));
+        recv_kmerseeds[i].kmer = *(uint64_t*)(addrs2read);
+        recv_kmerseeds[i].readid = readid;
+        recv_kmerseeds[i].posinread = pos;
+
+        if(i < 100)
+            logger() << pos<<" "<<recv_kmerseeds[i].posinread<<" ";
+        addrs2read += seedbytes;
+
+    }
+
+    logger.Flush("K-mer pushing first 100");
+
+    for (size_t i = 0; i < 100; i++) {
+       logger() << recv_kmerseeds[i].kmer << " ";
+    }
+    
+
+    logger.Flush("K-mer pushed first 100");
+
+    timer.stop_and_log("K-mer stored into local datastructure");
+    timer.start();
+
+    paradis::sort<KmerSeedStruct>(recv_kmerseeds.data(), recv_kmerseeds.data() + numkmerseeds, NUM_OMP_THREADS);
+
+    timer.stop_and_log("Shared memory parallel K-mer sorting");
+    // logger()<< "K-mer sorting first 100"<<std::endl;
+    for (int i = 0; i < 100; i++) {
+        logger() << recv_kmerseeds[i].kmer << " ";
+    }
+    logger.Flush("K-mer sorting first 100");
+
+    timer.start();
+
+
+    size_t start_idx[NUM_OMP_THREADS + 1];
+    
+    // yfli: finding the starting idx for each thread
+    // some bug will be introduced here, if the data size is too small
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        int nthreads = omp_get_num_threads();
+
+        if ( tid == 0 ){
+            start_idx[0] = 0;
+        } else {
+            size_t idx = tid * (numkmerseeds / nthreads);
+            uint64_t last_mer = recv_kmerseeds[idx].kmer;
+            uint64_t cur_mer = recv_kmerseeds[idx].kmer;
+
+            while (true) {
+                cur_mer = recv_kmerseeds[idx - 1].kmer;
+                if(cur_mer != last_mer) {
+                    start_idx[tid] = idx;
+                    break;
+                }
+                idx--;
+                last_mer = cur_mer;
+            }
+        }
+    }
+
+    start_idx[NUM_OMP_THREADS] = numkmerseeds;
+
+    logger()<< "start_idx: "<<std::endl;
+    for (int i = 0; i < NUM_OMP_THREADS + 1; i++) {
+        logger() << start_idx[i] << " ";
+    }
+    logger.Flush("start_idx");
+
+    uint64_t valid_kmer[NUM_OMP_THREADS];
+    KmerList kmerlists[NUM_OMP_THREADS];
+
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        size_t cur_kmer_cnt = 1;
+
+        kmerlists[tid].reserve(int(numkmerseeds / NUM_OMP_THREADS / LOWER_KMER_FREQ));    // This should be enough
+        uint64_t last_mer = recv_kmerseeds[start_idx[tid]].kmer;
+        valid_kmer[tid] = 0;
+
+        for(size_t cur_idx = start_idx[tid] + 1; cur_idx < start_idx[tid + 1]; cur_idx++) {
+            uint64_t cur_mer = recv_kmerseeds[cur_idx].kmer;
+            if (cur_mer == last_mer) {
+                cur_kmer_cnt++;
+            } else {
+                if (cur_kmer_cnt >= LOWER_KMER_FREQ && cur_kmer_cnt <= UPPER_KMER_FREQ) {
+
+                    kmerlists[tid].push_back(KmerListEntry());
+                    KmerListEntry& entry    = kmerlists[tid].back();
+
+                    TKmer& kmer             = std::get<0>(entry);
+                    READIDS& readids        = std::get<1>(entry);
+                    POSITIONS& positions    = std::get<2>(entry);
+                    int& count              = std::get<3>(entry);
+
+                    count = cur_kmer_cnt;
+                    kmer = TKmer(&last_mer);
+
+                    for (size_t j = cur_idx - count; j < cur_idx; j++) {
+                        readids[j - cur_idx + count] = recv_kmerseeds[j].readid;
+                        positions[j - cur_idx + count] = recv_kmerseeds[j].posinread;
+                    }
+
+                    valid_kmer[tid]++;
+
+                }
+                cur_kmer_cnt = 1;
+                last_mer = cur_mer;
+            }
+        }
+        // deal with the last kmer
+        if (cur_kmer_cnt >= LOWER_KMER_FREQ && cur_kmer_cnt <= UPPER_KMER_FREQ) {
+            kmerlists[tid].push_back(KmerListEntry());
+            KmerListEntry& entry         = kmerlists[tid].back();
+
+            TKmer& kmer             = std::get<0>(entry);
+            READIDS& readids        = std::get<1>(entry);
+            POSITIONS& positions    = std::get<2>(entry);
+            int& count              = std::get<3>(entry);
+
+            count = cur_kmer_cnt;
+            kmer = TKmer(&last_mer);
+
+            size_t cur_idx = start_idx[tid + 1];
+
+            for (size_t j = cur_idx - count; j < cur_idx; j++) {
+                readids[j - cur_idx + count] = recv_kmerseeds[j].readid;
+                positions[j - cur_idx + count] = recv_kmerseeds[j].posinread;
+            }
+
+            valid_kmer[tid]++;
+        }
+    }
+
+    logger() << std::get<int>(kmerlists[0][0]) << std::endl;
+    logger.Flush("count of 1st kmer");
+
+    for (int i = 0; i < NUM_OMP_THREADS; i++) {
+        logger() << valid_kmer[i] << " ";
+    }
+    logger.Flush("valid_kmer");
+
+    uint64_t valid_kmer_total = std::accumulate(valid_kmer, valid_kmer + NUM_OMP_THREADS, 0);
+    KmerList* kmerlist = new KmerList();
+    kmerlist->reserve(valid_kmer_total);
+
+    for (int i = 0; i < NUM_OMP_THREADS; i++) {
+        kmerlist->insert(kmerlist->end(), kmerlists[i].begin(), kmerlists[i].end());
+    }
+
+    int count  = std::get<3>(kmerlist->front());
+    logger() << count << std::endl;
+    logger.Flush("count of 1st kmer in overall list");
+
+    logger()<< kmerlist->size() << std::endl;
+    logger.Flush("kmerlist size");
+
+    logger() << "valid_kmer_total: " << valid_kmer_total << std::endl;
+    logger.Flush("valid_kmer_total");
+    timer.stop_and_log("K-mer filtering");
+
+    return std::unique_ptr<KmerList>(kmerlist);
+    // yfli: i'm not using hyperloglog currently, we may lead to some waste of memory.
+}
+
 int GetKmerOwner(const TKmer& kmer, int nprocs)
 {
     uint64_t myhash = kmer.GetHash();
@@ -481,12 +761,12 @@ int GetKmerOwner(const TKmer& kmer, int nprocs)
 }
 
 std::unique_ptr<CT<PosInRead>::PSpParMat>
-create_kmer_matrix(const DnaBuffer& myreads, const KmerCountMap& kmermap, std::shared_ptr<CommGrid> commgrid)
+create_kmer_matrix(const DnaBuffer& myreads, const KmerList& kmerlist, std::shared_ptr<CommGrid> commgrid)
 {
     int myrank = commgrid->GetRank();
     int nprocs = commgrid->GetSize();
 
-    int64_t kmerid = kmermap.size();
+    int64_t kmerid = kmerlist.size();
     int64_t totkmers = kmerid;
     int64_t totreads = myreads.size();
 
@@ -499,11 +779,11 @@ create_kmer_matrix(const DnaBuffer& myreads, const KmerCountMap& kmermap, std::s
     std::vector<int64_t> local_rowids, local_colids;
     std::vector<PosInRead> local_positions;
 
-    for (auto itr = kmermap.cbegin(); itr != kmermap.cend(); ++itr)
+    for (size_t i = 0; i < kmerlist.size(); i++)
     {
-        const READIDS& readids = std::get<0>(itr->second);
-        const POSITIONS& positions = std::get<1>(itr->second);
-        int cnt = std::get<2>(itr->second);
+        const READIDS& readids = std::get<1>(kmerlist[i]);
+        const POSITIONS& positions = std::get<2>(kmerlist[i]);
+        int cnt = std::get<3>(kmerlist[i]);
 
         for (int j = 0; j < cnt; ++j)
         {
