@@ -1,5 +1,7 @@
-// Taken from github
-#pragma once
+#ifndef PARADIS_SORT_HPP
+#define PARADIS_SORT_HPP
+
+/* This code is taken from github. it is working, but I'd like to overwrite it completely. */
 
 #include <omp.h>
 
@@ -30,7 +32,6 @@ template <typename T> inline void swap(T *a, T *b) {
   *b = t;
 }
 
-template <typename T> inline size_t size(T *a, T *b) { return b - a; }
 } // namespace sort_utils
 
 template <typename T> long long determineDigitBucket(int stage, T num) {
@@ -208,16 +209,18 @@ inline void radix_sort_par(T *s, T *t, T *begin_itr, long long processes = 1) {
   }
 }
 
-template <typename T> void sort(T *begin, T *end, size_t thread_count) {
+template <typename T, size_t sz> void sort(T *begin, T *end, size_t thread_count) {
   
-  radix_sort_par<7>(begin, end, begin, thread_count);
+  radix_sort_par<sz - 1>(begin, end, begin, thread_count);
 // yfli: this is absolutely experimental, wrong for most cases
 
 }
 
-template <> void sort<float>(float *begin, float *end, size_t thread_count) {}
+// template <> void sort<float>(float *begin, float *end, size_t thread_count) {}
 
-template <>
-void sort<double>(double *begin, double *end, size_t thread_count) {}
+// template <>
+// void sort<double>(double *begin, double *end, size_t thread_count) {}
 
 } // namespace paradis
+
+#endif // PARADIS_SORT_HPP

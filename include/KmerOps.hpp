@@ -5,7 +5,6 @@
 #include "Kmer.hpp"
 #include "DnaSeq.hpp"
 #include "DnaBuffer.hpp"
-#include "HyperLogLog.hpp"
 
 #ifndef MAX_ALLTOALL_MEM
 #define MAX_ALLTOALL_MEM (128ULL * 1024ULL * 1024ULL * 1024ULL)
@@ -16,26 +15,29 @@ typedef  int64_t ReadId;
 
 typedef std::array<PosInRead, UPPER_KMER_FREQ> POSITIONS;
 typedef std::array<ReadId,    UPPER_KMER_FREQ> READIDS;
-
 typedef std::tuple<TKmer, ReadId, PosInRead> KmerSeed;
-typedef std::tuple<READIDS, POSITIONS, int> KmerCountEntry;
-typedef std::unordered_map<TKmer, KmerCountEntry> KmerCountMap;
 
-// yfli: just experimenting, this part of code definitely need some refactoring
+typedef std::tuple<TKmer, READIDS, POSITIONS, int> KmerListEntry;
+typedef std::vector<KmerListEntry> KmerList;
 
+
+/* yfli: This struct stores the same information as KmerSeed */
+/* I need this struct because the GetByte() member function is necessary for sorting */
 struct KmerSeedStruct{
-    uint64_t kmer;      // yfli: temporary solution, need to be refactored
+    TKmer kmer;      
     ReadId readid;
     PosInRead posinread;
 
-    // KmerSeedStruct(TKmer kmer, ReadId readid, PosInRead posinread) : kmer(kmer), readid(readid), posinread(posinread) {};
-    KmerSeedStruct(uint64_t* kmer_addr, ReadId readid, PosInRead posinread) : kmer(*kmer_addr), readid(readid), posinread(posinread) {};
+    KmerSeedStruct(TKmer kmer, ReadId readid, PosInRead posinread) : kmer(kmer), readid(readid), posinread(posinread) {};
     KmerSeedStruct(const KmerSeedStruct& o) : kmer(o.kmer), readid(o.readid), posinread(o.posinread) {};
+    KmerSeedStruct(const KmerSeed& o) : kmer(std::get<0>(o)), readid(std::get<1>(o)), posinread(std::get<2>(o)) {};
+    KmerSeedStruct(KmerSeedStruct&& o) :    // yfli: Not sure if it's appropriate to use std::move() here
+        kmer(std::move(o.kmer)), readid(std::move(o.readid)), posinread(std::move(o.posinread)) {};
     KmerSeedStruct() {};
 
-    long long GetByte(int &i) const
+    int GetByte(int &i) const
     {
-        return (kmer >> (8*i)) & 0xff;
+        return kmer.getByte(i);
     }
 
     bool operator<(const KmerSeedStruct& o) const
@@ -62,20 +64,12 @@ struct KmerSeedStruct{
     }
 };
 
-// used in the radix sort approach
-typedef std::tuple<TKmer, READIDS, POSITIONS, int> KmerListEntry;
-typedef std::vector<KmerListEntry> KmerList;
-
 std::unique_ptr<CT<PosInRead>::PSpParMat>
 create_kmer_matrix(const DnaBuffer& myreads, const KmerList& kmerlist, std::shared_ptr<CommGrid> commgrid);
-
-std::unique_ptr<KmerCountMap>
-get_kmer_count_map_keys(const DnaBuffer& myreads, std::shared_ptr<CommGrid> commgrid);
 
 std::unique_ptr<KmerList>
 get_kmer_list(const DnaBuffer& myreads, std::shared_ptr<CommGrid> commgrid);
 
-void get_kmer_count_map_values(const DnaBuffer& myreads, KmerCountMap& kmermap, std::shared_ptr<CommGrid> commgrid);
 int GetKmerOwner(const TKmer& kmer, int nprocs);
 
 struct BatchState
@@ -103,6 +97,8 @@ struct BatchState
     }
 };
 
+// may need that in the future
+/*
 struct KmerEstimateHandler
 {
     HyperLogLog& hll;
@@ -115,6 +111,7 @@ struct KmerEstimateHandler
         hll.add(s.c_str());
     }
 };
+*/
 
 struct KmerPartitionHandler
 {
@@ -179,6 +176,42 @@ void ForeachKmer(const DnaBuffer& myreads, KmerHandler& handler)
         for (auto meritr = repmers.begin(); meritr != repmers.end(); ++meritr, ++j)
         {
             handler(*meritr, j, i);
+        }
+    }
+}
+
+template <typename KmerHandler>
+void ForeachKmerParallel(const DnaBuffer& myreads, std::vector<KmerHandler>& handlers, int nprocs)
+{
+    assert(nprocs > 0);
+
+    /*
+     * Go through each local read.
+     */
+
+    #pragma omp parallel for num_threads(nprocs) schedule(static)   /* yfli: maybe we can try other strategies */
+    for (size_t i = 0; i < myreads.size(); ++i)
+    {
+        int tid = omp_get_thread_num();
+        /*
+         * If it is too small then continue to the next one.
+         */
+        if (myreads[i].size() < KMER_SIZE)
+            continue;
+
+        /*
+         * Get all the representative k-mer seeds.
+         */
+        std::vector<TKmer> repmers = TKmer::GetRepKmers(myreads[i]);
+
+        size_t j = 0;
+
+        /*
+         * Go through each k-mer seed.
+         */
+        for (auto meritr = repmers.begin(); meritr != repmers.end(); ++meritr, ++j)
+        {
+            handlers[tid](*meritr, j, i);
         }
     }
 }
