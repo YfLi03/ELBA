@@ -19,12 +19,16 @@ get_kmer_list(const DnaBuffer& myreads, std::shared_ptr<CommGrid> commgrid)
 
     int myrank = commgrid->GetRank();
     int nprocs = commgrid->GetSize();
+    Logger logger(commgrid);
 
-    int thread_num = omp_get_max_threads();
+
+    int thread_num = omp_get_max_threads();                         // yfli: is not working well
+    logger() << thread_num << std::endl;
+    logger.Flush("thread_num");
+
 
     size_t numreads = myreads.size();                              /* Number of locally stored reads */
 
-    Logger logger(commgrid);
     std::ostringstream rootlog;
 
     MPITimer timer(comm);
@@ -84,25 +88,30 @@ get_kmer_list(const DnaBuffer& myreads, std::shared_ptr<CommGrid> commgrid)
     logger.Flush("K-mer exchange sendcounts:");
     #endif
 
+    MPI_Count_type max_send = *std::max_element(sendcnt.begin(), sendcnt.end());
+    MPI_Count_type buf_size = 0;
+    MPI_Allreduce(&max_send, &buf_size, 1, MPI_COUNT_TYPE, MPI_MAX, commgrid->GetWorld());
+    MPI_Count_type total_buf = buf_size * nprocs;
     // exchange the send/recv cnt information to prepare for data transfer
     MPI_ALLTOALL(sendcnt.data(), 1, MPI_COUNT_TYPE, recvcnt.data(), 1, MPI_COUNT_TYPE, commgrid->GetWorld());
-
+    /*
+    
     sdispls.front() = rdispls.front() = 0;
     std::partial_sum(sendcnt.begin(), sendcnt.end()-1, sdispls.begin()+1);
     std::partial_sum(recvcnt.begin(), recvcnt.end()-1, rdispls.begin()+1);
 
     size_t totsend = std::accumulate(sendcnt.begin(), sendcnt.end(), 0);
     size_t totrecv = std::accumulate(recvcnt.begin(), recvcnt.end(), 0);
-
+    */
     // copying data to the sendbuf
     // yfli: maybe these memcpy can be combined into fewer operations by adjusting the data structure
-    std::vector<uint8_t> sendbuf(totsend, 0);
+    std::vector<uint8_t> sendbuf(total_buf, 0);
 
     # pragma omp parallel for num_threads(thread_num) schedule(static)
     for (int i = 0; i < nprocs; ++i)
     {
         assert(kmerseeds[i].size() == (sendcnt[i] / seedbytes));
-        uint8_t *addrs2fill = sendbuf.data() + sdispls[i];
+        uint8_t *addrs2fill = sendbuf.data() + i * buf_size;
         for (MPI_Count_type j = 0; j < kmerseeds[i].size(); ++j)
         {
             auto& seeditr = kmerseeds[i][j];
@@ -119,12 +128,15 @@ get_kmer_list(const DnaBuffer& myreads, std::shared_ptr<CommGrid> commgrid)
     timer.stop_and_log("K-mer packing");
     timer.start();
 
-    std::vector<uint8_t> recvbuf(totrecv, 0);
-    MPI_ALLTOALLV(sendbuf.data(), sendcnt.data(), sdispls.data(), MPI_BYTE, recvbuf.data(), recvcnt.data(), rdispls.data(), MPI_BYTE, commgrid->GetWorld());
+    std::vector<uint8_t> recvbuf(total_buf, 0);
+    // MPI_ALLTOALLV(sendbuf.data(), sendcnt.data(), sdispls.data(), MPI_BYTE, recvbuf.data(), recvcnt.data(), rdispls.data(), MPI_BYTE, commgrid->GetWorld());
+    MPI_ALLTOALL(sendbuf.data(), buf_size, MPI_BYTE, recvbuf.data(), buf_size, MPI_BYTE, commgrid->GetWorld());
+    /* compared to the MPI_ALLTOALLV, MPI_ALLTOALL is faster when we have more data to send */
+    /* we need to have a trade off here */
     timer.stop_and_log("K-mer exchange");
     timer.start();
 
-    size_t numkmerseeds = totrecv / seedbytes;
+    size_t numkmerseeds = std::accumulate(recvcnt.begin(), recvcnt.end(), 0) / seedbytes;
 
     #if LOG_LEVEL >= 2
     logger() << "received a total of " << numkmerseeds << " 'row' k-mers in second ALLTOALL exchange";
@@ -135,14 +147,18 @@ get_kmer_list(const DnaBuffer& myreads, std::shared_ptr<CommGrid> commgrid)
     std::vector<KmerSeedStruct> recv_kmerseeds;
     recv_kmerseeds.reserve(numkmerseeds);
 
-    for (size_t i = 0; i < numkmerseeds; i++ ) 
+    for (size_t i = 0; i < nprocs; i++)
     {
-        ReadId readid = *((ReadId*)(addrs2read + TKmer::NBYTES));
-        PosInRead pos = *((PosInRead*)(addrs2read + TKmer::NBYTES + sizeof(ReadId)));
-        TKmer kmer((void*)addrs2read);
-        recv_kmerseeds.push_back(KmerSeedStruct(kmer, readid, pos));
+        addrs2read = recvbuf.data() + i * buf_size;
+        for (size_t j = 0; j < recvcnt[i] / seedbytes; j++)
+        {
+            ReadId readid = *((ReadId*)(addrs2read + TKmer::NBYTES));
+            PosInRead pos = *((PosInRead*)(addrs2read + TKmer::NBYTES + sizeof(ReadId)));
+            TKmer kmer((void*)addrs2read);
+            recv_kmerseeds.push_back(KmerSeedStruct(kmer, readid, pos));
 
-        addrs2read += seedbytes;
+            addrs2read += seedbytes;
+        }
     }
 
     timer.stop_and_log("K-mer stored into local data structure");
