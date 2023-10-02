@@ -10,6 +10,8 @@
 #define MAX_ALLTOALL_MEM (128ULL * 1024ULL * 1024ULL * 1024ULL)
 #endif
 
+#define MAX_THREAD_MEMORY_BOUNDED 4 // experimental. we may need to change this value according to process/node configuration
+
 typedef uint32_t PosInRead;
 typedef  int64_t ReadId;
 
@@ -20,6 +22,9 @@ typedef std::tuple<TKmer, ReadId, PosInRead> KmerSeed;
 typedef std::tuple<TKmer, READIDS, POSITIONS, int> KmerListEntry;
 typedef std::vector<KmerListEntry> KmerList;
 
+#define S_BYTE 2
+#define S_BIT (S_BYTE << 3)
+#define S_DEC (1 << S_BIT)
 
 /* yfli: This struct stores the same information as KmerSeed */
 /* I need this struct because the GetByte() member function is necessary for sorting */
@@ -38,6 +43,24 @@ struct KmerSeedStruct{
     int GetByte(int &i) const
     {
         return kmer.getByte(i);
+    }
+
+    // yfli: this is an experimental version
+    int GetBytes(int &i) const
+    {
+        const void* value = kmer.GetBytes();
+        /*
+        int ret = (int)(*(reinterpret_cast<const char*>(value) + 2 * i + 1));
+        assert(ret < 256);
+        assert(ret >= 0);
+        ret = ( ret << 8 ) + (int)(*(reinterpret_cast<const char*>(value) + 2 * i));
+        assert(ret < 65536);
+        assert(ret >= 0);
+        */
+
+        int ret = (*(int*)(static_cast<const char*>(value) + 2 * i)) & (S_DEC - 1);
+
+        return ret;
     }
 
     bool operator<(const KmerSeedStruct& o) const
@@ -115,19 +138,19 @@ struct KmerEstimateHandler
 
 struct KmerPartitionHandler
 {
-    int nprocs;
+    int nthreads_tot;
     std::vector<std::vector<TKmer>>& kmerbuckets;
 
-    KmerPartitionHandler(std::vector<std::vector<TKmer>>& kmerbuckets) : nprocs(kmerbuckets.size()), kmerbuckets(kmerbuckets) {}
+    KmerPartitionHandler(std::vector<std::vector<TKmer>>& kmerbuckets) : nthreads_tot(kmerbuckets.size()), kmerbuckets(kmerbuckets) {}
 
     void operator()(const TKmer& kmer, size_t kid, size_t rid)
     {
-        kmerbuckets[GetKmerOwner(kmer, nprocs)].push_back(kmer);
+        kmerbuckets[GetKmerOwner(kmer, nthreads_tot)].push_back(kmer);
     }
 
     void operator()(const TKmer& kmer, BatchState& state, size_t kid)
     {
-        auto& kmerbucket = kmerbuckets[GetKmerOwner(kmer, nprocs)];
+        auto& kmerbucket = kmerbuckets[GetKmerOwner(kmer, nthreads_tot)];
         kmerbucket.push_back(kmer);
         state.mymaxsending = std::max(kmerbucket.size(), state.mymaxsending);
     }
@@ -181,15 +204,18 @@ void ForeachKmer(const DnaBuffer& myreads, KmerHandler& handler)
 }
 
 template <typename KmerHandler>
-void ForeachKmerParallel(const DnaBuffer& myreads, std::vector<KmerHandler>& handlers, int nprocs)
+void ForeachKmerParallel(const DnaBuffer& myreads, std::vector<KmerHandler>& handlers, int nthreads)
 {
-    assert(nprocs > 0);
+    assert(nthreads > 0);
 
     /*
      * Go through each local read.
      */
 
-    #pragma omp parallel for num_threads(nprocs) schedule(static)   /* yfli: maybe we can try other strategies */
+    omp_set_num_threads(std::min(nthreads, MAX_THREAD_MEMORY_BOUNDED)); 
+    // yfli: TODO: test the performance of different number of threads. This might be a memory bandwidth issue.
+
+    #pragma omp parallel for schedule(static)   // yfli: maybe we can try other strategies 
     for (size_t i = 0; i < myreads.size(); ++i)
     {
         int tid = omp_get_thread_num();
