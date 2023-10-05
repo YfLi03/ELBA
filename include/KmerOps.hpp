@@ -10,7 +10,6 @@
 #define MAX_ALLTOALL_MEM (128ULL * 1024ULL * 1024ULL * 1024ULL)
 #endif
 
-#define MAX_THREAD_MEMORY_BOUNDED 4 // experimental. we may need to change this value according to process/node configuration
 
 typedef uint32_t PosInRead;
 typedef  int64_t ReadId;
@@ -22,9 +21,8 @@ typedef std::tuple<TKmer, ReadId, PosInRead> KmerSeed;
 typedef std::tuple<TKmer, READIDS, POSITIONS, int> KmerListEntry;
 typedef std::vector<KmerListEntry> KmerList;
 
-#define S_BYTE 2
-#define S_BIT (S_BYTE << 3)
-#define S_DEC (1 << S_BIT)
+#define DEFAULT_THREAD_PER_TASK 4
+#define MAX_THREAD_MEMORY_BOUNDED 8
 
 /* yfli: This struct stores the same information as KmerSeed */
 /* I need this struct because the GetByte() member function is necessary for sorting */
@@ -43,24 +41,6 @@ struct KmerSeedStruct{
     int GetByte(int &i) const
     {
         return kmer.getByte(i);
-    }
-
-    // yfli: this is an experimental version
-    int GetBytes(int &i) const
-    {
-        const void* value = kmer.GetBytes();
-        /*
-        int ret = (int)(*(reinterpret_cast<const char*>(value) + 2 * i + 1));
-        assert(ret < 256);
-        assert(ret >= 0);
-        ret = ( ret << 8 ) + (int)(*(reinterpret_cast<const char*>(value) + 2 * i));
-        assert(ret < 65536);
-        assert(ret >= 0);
-        */
-
-        int ret = (*(int*)(static_cast<const char*>(value) + 2 * i)) & (S_DEC - 1);
-
-        return ret;
     }
 
     bool operator<(const KmerSeedStruct& o) const
@@ -87,11 +67,22 @@ struct KmerSeedStruct{
     }
 };
 
+typedef std::vector<std::vector<KmerSeedStruct>> KmerSeedBuckets;
+
 std::unique_ptr<CT<PosInRead>::PSpParMat>
 create_kmer_matrix(const DnaBuffer& myreads, const KmerList& kmerlist, std::shared_ptr<CommGrid> commgrid);
 
+std::unique_ptr<KmerSeedBuckets> 
+exchange_kmer(const DnaBuffer& myreads,
+     std::shared_ptr<CommGrid> commgrid,
+     int thr_per_task = DEFAULT_THREAD_PER_TASK,
+     int max_thr_membounded = MAX_THREAD_MEMORY_BOUNDED);
+
 std::unique_ptr<KmerList>
-get_kmer_list(const DnaBuffer& myreads, std::shared_ptr<CommGrid> commgrid);
+filter_kmer(std::unique_ptr<KmerSeedBuckets>& recv_kmerseeds, 
+     std::shared_ptr<CommGrid> commgrid, 
+     int thr_per_task = DEFAULT_THREAD_PER_TASK);
+
 
 int GetKmerOwner(const TKmer& kmer, int nprocs);
 
@@ -212,10 +203,9 @@ void ForeachKmerParallel(const DnaBuffer& myreads, std::vector<KmerHandler>& han
      * Go through each local read.
      */
 
-    omp_set_num_threads(std::min(nthreads, MAX_THREAD_MEMORY_BOUNDED)); 
     // yfli: TODO: test the performance of different number of threads. This might be a memory bandwidth issue.
 
-    #pragma omp parallel for schedule(static)   // yfli: maybe we can try other strategies 
+    #pragma omp parallel for num_threads(nthreads)
     for (size_t i = 0; i < myreads.size(); ++i)
     {
         int tid = omp_get_thread_num();
