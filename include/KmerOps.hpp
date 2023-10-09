@@ -22,7 +22,7 @@ typedef std::tuple<TKmer, READIDS, POSITIONS, int> KmerListEntry;
 typedef std::vector<KmerListEntry> KmerList;
 
 #define DEFAULT_THREAD_PER_TASK 4
-#define MAX_THREAD_MEMORY_BOUNDED 8
+#define MAX_THREAD_MEMORY_BOUNDED 16
 
 /* yfli: This struct stores the same information as KmerSeed */
 /* I need this struct because the GetByte() member function is necessary for sorting */

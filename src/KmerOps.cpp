@@ -19,7 +19,10 @@ exchange_kmer(const DnaBuffer& myreads,
      int max_thr_membounded)
 {
     MPI_Comm comm = MPI_COMM_WORLD;
+
+    #if LOG_LEVEL >= 3
     MPITimer timer(comm);
+    #endif
 
     int myrank = commgrid->GetRank();
     int nprocs = commgrid->GetSize();
@@ -27,7 +30,6 @@ exchange_kmer(const DnaBuffer& myreads,
 
     Logger logger(commgrid);
     std::ostringstream rootlog;
-
 
     omp_set_nested(1);
     int ntasks = omp_get_max_threads() / thr_per_task;
@@ -53,7 +55,9 @@ exchange_kmer(const DnaBuffer& myreads,
     logger.Flush("Thread count used for memory bounded operations:");
     #endif
 
+    #if LOG_LEVEL >= 3
     timer.start();
+    #endif
 
     size_t readoffset = numreads;         // yfli: not sure if we need this initial value
     if (!single_node)
@@ -74,8 +78,10 @@ exchange_kmer(const DnaBuffer& myreads,
 
     ForeachKmerParallel(myreads, parser_vecs, nthr_membounded);
 
+    #if LOG_LEVEL >= 3
     timer.stop_and_log("K-mer partioning");
     timer.start();
+    #endif
 
     /* merge the seed vecs into one for each task*/
     #pragma omp parallel for num_threads(nthr_membounded)
@@ -84,7 +90,10 @@ exchange_kmer(const DnaBuffer& myreads,
             kmerseeds[j].insert(kmerseeds[j].end(), kmerseeds_vecs[i][j].begin(), kmerseeds_vecs[i][j].end());
         }
     }
+
+    #if LOG_LEVEL >= 3
     timer.stop_and_log("K-mer copying");
+    #endif
 
     /* 
      * (yfli)
@@ -99,19 +108,29 @@ exchange_kmer(const DnaBuffer& myreads,
     if (nprocs == 1){
         // yfli: we're definitely wasting some time here
         // consider switching to the KMerSeedStruct completely
+
+        #if LOG_LEVEL >= 3
         timer.start();
+        #endif
+
         #pragma omp parallel for num_threads(nthr_membounded)
         for (int i = 0; i < ntasks; i++) {
             (*recv_kmerseeds)[i].insert((*recv_kmerseeds)[i].end(), kmerseeds[i].begin(), kmerseeds[i].end());
         }
+
+        #if LOG_LEVEL >= 3
         timer.stop_and_log("Local K-mer format conversion (nprocs == 1) ");
+        #endif
 
         /* for 1 process, no MPI communication is necessary*/
         return std::unique_ptr<KmerSeedBuckets>(recv_kmerseeds);
     } 
 
     /* more than 1 process, need MPI communication */
+
+    #if LOG_LEVEL >= 3
     timer.start();
+    #endif
 
 
     std::vector<MPI_Count_type> sendcnt(nprocs);
@@ -177,15 +196,20 @@ exchange_kmer(const DnaBuffer& myreads,
         }
         // kmerseeds[i].clear();
     }
+
+    #if LOG_LEVEL >= 3
     timer.stop_and_log("K-mer packing");
     timer.start();
+    #endif
 
     std::vector<uint8_t> recvbuf(total_buf, 0);
     /* compared to the MPI_ALLTOALLV, MPI_ALLTOALL is faster when we have more data to send */
     MPI_ALLTOALL(sendbuf.data(), buf_size, MPI_BYTE, recvbuf.data(), buf_size, MPI_BYTE, commgrid->GetWorld());
 
+    #if LOG_LEVEL >= 3
     timer.stop_and_log("MPI_Alltoall exchange");
     timer.start();
+    #endif
 
     size_t numkmerseeds = std::accumulate(rthrcnt.begin(), rthrcnt.end(), 0) / seedbytes;
 
@@ -224,8 +248,10 @@ exchange_kmer(const DnaBuffer& myreads,
         
     }
 
+    #if LOG_LEVEL >= 3
     timer.stop_and_log("K-mer stored into local data structure");
-    
+    #endif
+
     return std::unique_ptr<KmerSeedBuckets>(recv_kmerseeds);
 }
 
@@ -267,22 +293,26 @@ filter_kmer(std::unique_ptr<KmerSeedBuckets>& recv_kmerseeds, std::shared_ptr<Co
     logger.Flush("Parallel tasks for kmer sorting and counting:");
     #endif
 
+    #if LOG_LEVEL >= 3
     timer.start();
+    #endif
 
     // yfli: maybe ask omp to scatter the threads on different places
     #pragma omp parallel 
     {
         int tid = omp_get_thread_num();
         paradis::sort<KmerSeedStruct, TKmer::NBYTES>((*recv_kmerseeds)[tid].data(), (*recv_kmerseeds)[tid].data() + task_seedcnt[tid], thr_per_task);
+    
+    #if LOG_LEVEL >= 3
     }
-
     // yfli: this barrier can be removed after we make sure the sorting is correct and analyzed the performance
     timer.stop_and_log("Shared memory parallel K-mer sorting");
     timer.start();
-
     #pragma omp parallel
     {
         int tid = omp_get_thread_num();
+    #endif
+
 
         kmerlists[tid].reserve(uint64_t(task_seedcnt[tid] / LOWER_KMER_FREQ));    // This should be enough
         TKmer last_mer = (*recv_kmerseeds)[tid][0].kmer;
@@ -342,7 +372,10 @@ filter_kmer(std::unique_ptr<KmerSeedBuckets>& recv_kmerseeds, std::shared_ptr<Co
         }
     }
 
+    #if LOG_LEVEL >= 3
     timer.stop_and_log("K-mer counting");
+    timer.start();
+    #endif
 
     #if LOG_LEVEL >= 2
     for (int i = 0; i < ntasks; i++) {
@@ -351,7 +384,6 @@ filter_kmer(std::unique_ptr<KmerSeedBuckets>& recv_kmerseeds, std::shared_ptr<Co
     logger.Flush("Valid kmer from tasks:");
     #endif
 
-    timer.start();
 
     uint64_t valid_kmer_total = std::accumulate(valid_kmer, valid_kmer + ntasks, 0);
     KmerList* kmerlist = new KmerList();
@@ -365,7 +397,9 @@ filter_kmer(std::unique_ptr<KmerSeedBuckets>& recv_kmerseeds, std::shared_ptr<Co
     logger() << valid_kmer_total;
     logger.Flush("Valid kmer for process:");
 
+    #if LOG_LEVEL >= 3
     timer.stop_and_log("K-mer copying");
+    #endif
 
     return std::unique_ptr<KmerList>(kmerlist);
 }

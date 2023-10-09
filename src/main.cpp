@@ -234,6 +234,9 @@ int main(int argc, char **argv)
 
         dfd.wait();
 
+        MPI_Finalize();
+        return 0;
+
         /*
          * In order to obtain reliable overlaps, we need to do some alignments.
          * The @B matrix provides the seeds (common k-mers) from which we
