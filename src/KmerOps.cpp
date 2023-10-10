@@ -103,7 +103,7 @@ exchange_kmer(const DnaBuffer& myreads,
      */
     KmerSeedBuckets* recv_kmerseeds = new KmerSeedBuckets;
     recv_kmerseeds->resize(ntasks);
-    std::vector<MPI_Count_type> task_seedcnt(ntasks);
+    std::vector<uint64_t> task_seedcnt(ntasks);
 
     if (nprocs == 1){
         // yfli: we're definitely wasting some time here
@@ -133,10 +133,10 @@ exchange_kmer(const DnaBuffer& myreads,
     #endif
 
 
-    std::vector<MPI_Count_type> sendcnt(nprocs);
+    std::vector<uint64_t> sendcnt(nprocs);
     std::vector<MPI_Displ_type> sdispls(nprocs), rdispls(nprocs);
-    std::vector<MPI_Count_type> sthrcnt(nprocs * ntasks), rthrcnt(nprocs * ntasks); /* data count IN Bytes */
-    MPI_Count_type buf_size = 0;    /* max of sendcnts over all processes*/
+    std::vector<uint64_t> sthrcnt(nprocs * ntasks), rthrcnt(nprocs * ntasks); /* data count IN Bytes */
+    uint64_t buf_size = 0;    /* max of sendcnts over all processes*/
 
 
     constexpr size_t seedbytes = TKmer::NBYTES + sizeof(ReadId) + sizeof(PosInRead);
@@ -162,12 +162,12 @@ exchange_kmer(const DnaBuffer& myreads,
     logger.Flush("K-mer exchange sendcounts:");
     #endif
 
-    MPI_Count_type max_send = *std::max_element(sendcnt.begin(), sendcnt.end());
-    MPI_Allreduce(&max_send, &buf_size, 1, MPI_COUNT_TYPE, MPI_MAX, commgrid->GetWorld());
-    MPI_Count_type total_buf = buf_size * nprocs;
+    uint64_t max_send = *std::max_element(sendcnt.begin(), sendcnt.end());
+    MPI_Allreduce(&max_send, &buf_size, 1, MPI_UNSIGNED_LONG_LONG, MPI_MAX, commgrid->GetWorld());
+    uint64_t total_buf = buf_size * nprocs;
 
     /* exchange the send/recv cnt information to prepare for data transfer */
-    MPI_ALLTOALL(sthrcnt.data(), ntasks, MPI_COUNT_TYPE, rthrcnt.data(), ntasks, MPI_COUNT_TYPE, commgrid->GetWorld());
+    MPI_ALLTOALL(sthrcnt.data(), ntasks, MPI_UNSIGNED_LONG_LONG, rthrcnt.data(), ntasks, MPI_UNSIGNED_LONG_LONG, commgrid->GetWorld());
 
     /* copy data to the sendbuf */
     // yfli: we're doing many times of redandant memcpy here actually, maybe try avoid this if performance is not good
@@ -181,7 +181,7 @@ exchange_kmer(const DnaBuffer& myreads,
         /* padding is done for processes but not tasks */
 
         for (int j = 0; j < ntasks; j++ ) {
-            for (MPI_Count_type k = 0; k < kmerseeds[i * ntasks + j].size(); k++ )
+            for (uint64_t k = 0; k < kmerseeds[i * ntasks + j].size(); k++ )
             {
                 auto& seeditr = kmerseeds[i * ntasks + j][k];
                 TKmer kmer = std::get<0>(seeditr);
@@ -211,7 +211,7 @@ exchange_kmer(const DnaBuffer& myreads,
     timer.start();
     #endif
 
-    size_t numkmerseeds = std::accumulate(rthrcnt.begin(), rthrcnt.end(), 0) / seedbytes;
+    size_t numkmerseeds = std::accumulate(rthrcnt.begin(), rthrcnt.end(), (uint64_t)0) / seedbytes;
 
     #if LOG_LEVEL >= 2
     logger() << "received a total of " << numkmerseeds << " valid 'row' k-mers in second ALLTOALL exchange";
@@ -226,7 +226,7 @@ exchange_kmer(const DnaBuffer& myreads,
             task_seedcnt[i] += (rthrcnt[j * ntasks + i] / seedbytes);
         }
     }
-    assert(numkmerseeds == std::accumulate(task_seedcnt.begin(), task_seedcnt.end(), 0));
+    assert(numkmerseeds == std::accumulate(task_seedcnt.begin(), task_seedcnt.end(), (uint64_t)0));
 
     for (int i = 0; i < ntasks; i++) {
         (*recv_kmerseeds)[i].reserve(task_seedcnt[i]);
@@ -385,7 +385,7 @@ filter_kmer(std::unique_ptr<KmerSeedBuckets>& recv_kmerseeds, std::shared_ptr<Co
     #endif
 
 
-    uint64_t valid_kmer_total = std::accumulate(valid_kmer, valid_kmer + ntasks, 0);
+    uint64_t valid_kmer_total = std::accumulate(valid_kmer, valid_kmer + ntasks, (uint64_t)0);
     KmerList* kmerlist = new KmerList();
     kmerlist->reserve(valid_kmer_total);
 
