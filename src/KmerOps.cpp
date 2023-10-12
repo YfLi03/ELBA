@@ -37,7 +37,6 @@ exchange_kmer(const DnaBuffer& myreads,
         ntasks = 1;
         thr_per_task = omp_get_max_threads();
     }
-    /* each process should have the same number of tasks */
 
     /* for memory bounded operations in this stage, we use another number of threads */
     int nthr_membounded = std::min(omp_get_max_threads() , max_thr_membounded);
@@ -48,9 +47,6 @@ exchange_kmer(const DnaBuffer& myreads,
     #if LOG_LEVEL >= 2
     logger() << ntasks << " \t (thread per task: " << thr_per_task << ")";
     logger.Flush("Task num:");
-    #endif
-
-    #if LOG_LEVEL >= 2
     logger() << nthr_membounded ;
     logger.Flush("Thread count used for memory bounded operations:");
     #endif
@@ -96,14 +92,13 @@ exchange_kmer(const DnaBuffer& myreads,
     #endif
 
     /* 
-     * (yfli)
+     * yfli:
      * generally speaking, for efficiency of MPI,
      * it's suggested to use 1 process per node for 1 node,
      * and 4 process per node for more than 1 node
      */
     KmerSeedBuckets* recv_kmerseeds = new KmerSeedBuckets;
     recv_kmerseeds->resize(ntasks);
-    std::vector<uint64_t> task_seedcnt(ntasks);
 
     if (nprocs == 1){
         // yfli: we're definitely wasting some time here
@@ -132,12 +127,11 @@ exchange_kmer(const DnaBuffer& myreads,
     timer.start();
     #endif
 
-
-    std::vector<uint64_t> sendcnt(nprocs);
-    std::vector<MPI_Displ_type> sdispls(nprocs), rdispls(nprocs);
-    std::vector<uint64_t> sthrcnt(nprocs * ntasks), rthrcnt(nprocs * ntasks); /* data count IN Bytes */
-    uint64_t buf_size = 0;    /* max of sendcnts over all processes*/
-
+    std::vector<uint64_t> task_seedcnt(ntasks);                                 /* number of kmer seeds for each local task in total */
+    std::vector<uint64_t> sendcnt(nprocs);                                      /* number of kmer seeds sending to each process */
+    std::vector<uint64_t> sthrcnt(nprocs * ntasks), rthrcnt(nprocs * ntasks);   /* number of kmer seeds for each global task (sending/reciving) */
+    uint64_t max_send = 0, max_send_global = 0, total_buf = 0;   
+    uint64_t send_limit = std::numeric_limits<MPI_Count_type>::max() / nprocs;               
 
     constexpr size_t seedbytes = TKmer::NBYTES + sizeof(ReadId) + sizeof(PosInRead);
 
@@ -148,12 +142,12 @@ exchange_kmer(const DnaBuffer& myreads,
     for (int i = 0; i < nprocs; ++i)
     {
         for (int j = 0; j < ntasks; j++) {
-            sendcnt[i] += kmerseeds[i * ntasks + j].size() * seedbytes;
-            sthrcnt[i * ntasks + j] = kmerseeds[i * ntasks + j].size() * seedbytes;
+            sendcnt[i] += kmerseeds[i * ntasks + j].size();
+            sthrcnt[i * ntasks + j] = kmerseeds[i * ntasks + j].size();
         }
         
         #if LOG_LEVEL >= 2
-        logger() << (static_cast<double>(sendcnt[i]) / (1024 * 1024)) << ",";
+        logger() << (static_cast<double>(sendcnt[i]) * seedbytes / (1024 * 1024)) << ",";
         #endif
     }
 
@@ -162,28 +156,45 @@ exchange_kmer(const DnaBuffer& myreads,
     logger.Flush("K-mer exchange sendcounts:");
     #endif
 
-    uint64_t max_send = *std::max_element(sendcnt.begin(), sendcnt.end());
-    MPI_Allreduce(&max_send, &buf_size, 1, MPI_UNSIGNED_LONG_LONG, MPI_MAX, commgrid->GetWorld());
-    uint64_t total_buf = buf_size * nprocs;
-
     /* exchange the send/recv cnt information to prepare for data transfer */
+    max_send = *std::max_element(sendcnt.begin(), sendcnt.end());
+    MPI_Allreduce(&max_send, &max_send_global, 1, MPI_UNSIGNED_LONG_LONG, MPI_MAX, commgrid->GetWorld());
+    total_buf = max_send_global * nprocs * seedbytes;
+
+    // yfli: not sure it's the total send cnt that matter, or the seperate one
+    if ( max_send_global * seedbytes > send_limit ) {
+        logger.Flush("Warning:\
+            \n\tSize of data exceeding the limit of int.\
+            \n\tUsing MPI version 4 , or increase the number of nodes is recommended.");
+    }
+
+    /* calculate the offset for each task */
     MPI_ALLTOALL(sthrcnt.data(), ntasks, MPI_UNSIGNED_LONG_LONG, rthrcnt.data(), ntasks, MPI_UNSIGNED_LONG_LONG, commgrid->GetWorld());
 
-    /* copy data to the sendbuf */
+    /* calculate how many kmer seeds each thread will receive */
+    size_t numkmerseeds = std::accumulate(rthrcnt.begin(), rthrcnt.end(), (uint64_t)0);
+
+    for (int i = 0; i < ntasks; i++) {
+        for (int j = 0; j < nprocs; j++) {
+            task_seedcnt[i] += rthrcnt[j * ntasks + i];
+        }
+    }
+    assert(numkmerseeds == std::accumulate(task_seedcnt.begin(), task_seedcnt.end(), (uint64_t)0));
+
+    /* preparing the sending buffer */
     // yfli: we're doing many times of redandant memcpy here actually, maybe try avoid this if performance is not good
     std::vector<uint8_t> sendbuf(total_buf, 0);
 
     # pragma omp parallel for num_threads(nthr_membounded)
     for (int i = 0; i < nprocs; i++ )
     {
-        // assert(kmerseeds[i].size() == (sendcnt[i] / seedbytes));
-        uint8_t *addrs2fill = sendbuf.data() + i * buf_size;
+        uint8_t *addrs2fill = sendbuf.data() + i * max_send_global * seedbytes;
         /* padding is done for processes but not tasks */
 
         for (int j = 0; j < ntasks; j++ ) {
-            for (uint64_t k = 0; k < kmerseeds[i * ntasks + j].size(); k++ )
+            for (uint64_t k = 0; k < kmerseeds[(size_t)i * ntasks + j].size(); k++ )
             {
-                auto& seeditr = kmerseeds[i * ntasks + j][k];
+                auto& seeditr = kmerseeds[(size_t)i * ntasks + j][k];
                 TKmer kmer = std::get<0>(seeditr);
                 ReadId readid = std::get<1>(seeditr);
                 PosInRead pos = std::get<2>(seeditr);
@@ -192,9 +203,12 @@ exchange_kmer(const DnaBuffer& myreads,
                 memcpy(addrs2fill + TKmer::NBYTES + sizeof(ReadId), &pos, sizeof(PosInRead));
                 addrs2fill += seedbytes;
             }
-            kmerseeds[i * ntasks + j].clear();
+            kmerseeds[(size_t)i * ntasks + j].clear();
         }
-        // kmerseeds[i].clear();
+    }
+
+    for (int i = 0; i < ntasks; i++) {
+        (*recv_kmerseeds)[i].reserve(task_seedcnt[i]);
     }
 
     #if LOG_LEVEL >= 3
@@ -203,41 +217,29 @@ exchange_kmer(const DnaBuffer& myreads,
     #endif
 
     std::vector<uint8_t> recvbuf(total_buf, 0);
+
     /* compared to the MPI_ALLTOALLV, MPI_ALLTOALL is faster when we have more data to send */
-    MPI_ALLTOALL(sendbuf.data(), buf_size, MPI_BYTE, recvbuf.data(), buf_size, MPI_BYTE, commgrid->GetWorld());
+    BatchSender bsender(commgrid, max_send_global * seedbytes, send_limit, sendbuf.data(), recvbuf.data());
+    bsender.send_all();
 
     #if LOG_LEVEL >= 3
     timer.stop_and_log("MPI_Alltoall exchange");
     timer.start();
     #endif
 
-    size_t numkmerseeds = std::accumulate(rthrcnt.begin(), rthrcnt.end(), (uint64_t)0) / seedbytes;
-
     #if LOG_LEVEL >= 2
-    logger() << "received a total of " << numkmerseeds << " valid 'row' k-mers in second ALLTOALL exchange";
+    logger() << "received a total of " << numkmerseeds << " valid 'row' k-mers in ALLTOALL exchange";
     logger.Flush("K-mers received:");
     #endif
 
     uint8_t *addrs2read = recvbuf.data();
 
-    // calculate how many kmer seeds each thread will receive
-    for (int i = 0; i < ntasks; i++) {
-        for (int j = 0; j < nprocs; j++) {
-            task_seedcnt[i] += (rthrcnt[j * ntasks + i] / seedbytes);
-        }
-    }
-    assert(numkmerseeds == std::accumulate(task_seedcnt.begin(), task_seedcnt.end(), (uint64_t)0));
-
-    for (int i = 0; i < ntasks; i++) {
-        (*recv_kmerseeds)[i].reserve(task_seedcnt[i]);
-    }
-
     for (size_t i = 0; i < nprocs; i++)
     {
-        addrs2read = recvbuf.data() + i * buf_size;
+        addrs2read = recvbuf.data() + i * max_send_global * seedbytes;
         for (size_t j = 0; j < ntasks; j++){
 
-            for (size_t k = 0; k < rthrcnt[ i * ntasks + j ] / seedbytes; k++ ){
+            for (size_t k = 0; k < rthrcnt[ i * ntasks + j ]; k++ ){
                 ReadId readid = *((ReadId*)(addrs2read + TKmer::NBYTES));
                 PosInRead pos = *((PosInRead*)(addrs2read + TKmer::NBYTES + sizeof(ReadId)));
                 TKmer kmer((void*)addrs2read);

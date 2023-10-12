@@ -25,6 +25,7 @@ INCADD=-I$(COMBBLAS)/include/ -I$(COMBBLAS)/psort-1.0/include/ -I$(COMBBLAS)/uso
 
 UNAME_S:=$(shell uname -s)
 
+# This does not work for other implementations such as OpenMPI / MPICH ( not cray MPICH )
 ifeq ($(UNAME_S),Linux)
 COMPILER=CC
 else ifeq ($(UNAME_S),Darwin)

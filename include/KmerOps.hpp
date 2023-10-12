@@ -111,6 +111,49 @@ struct BatchState
     }
 };
 
+struct BatchSender
+{
+    std::shared_ptr<CommGrid> commgrid;
+    size_t bytes_per_proc;
+    size_t send_threshold;
+    uint8_t* sendbuf;
+    uint8_t* recvbuf;
+
+    BatchSender(std::shared_ptr<CommGrid> commgrid, size_t bytes_per_proc, size_t send_threshold, uint8_t* sendbuf, uint8_t* recvbuf) : commgrid(commgrid), bytes_per_proc(bytes_per_proc), send_threshold(send_threshold), sendbuf(sendbuf), recvbuf(recvbuf) {}
+
+    void send_all()
+    {
+        int nprocs = commgrid->GetSize();
+        int myrank = commgrid->GetRank();
+
+        if ( bytes_per_proc <= send_threshold ) {
+            MPI_ALLTOALL(sendbuf, bytes_per_proc, MPI_BYTE, recvbuf, bytes_per_proc, MPI_BYTE, commgrid->GetWorld());
+            return;
+        }
+        int times = (bytes_per_proc - 1) / send_threshold + 1;
+
+        uint8_t* sendtmp = new uint8_t[send_threshold * nprocs];
+        uint8_t* recvtmp = new uint8_t[send_threshold * nprocs];
+
+        for(int i = 0; i < times; i++){
+            MPI_Count_type send_size = std::min(send_threshold, bytes_per_proc - i * send_threshold);
+            
+            for(int j = 0; j < nprocs; j++){
+                memcpy(sendtmp + j * send_size, sendbuf + i * send_threshold + j * bytes_per_proc, send_size);
+            }
+
+            MPI_ALLTOALL(sendtmp, send_size, MPI_BYTE, recvtmp, send_size, MPI_BYTE, commgrid->GetWorld());
+
+            for(int j = 0; j < nprocs; j++){
+                memcpy(recvbuf + i * send_threshold + j * bytes_per_proc, recvtmp + j * send_size, send_size);
+            }
+        }
+
+        delete[] sendtmp;
+        delete[] recvtmp;
+    }
+};
+
 // may need that in the future
 /*
 struct KmerEstimateHandler
