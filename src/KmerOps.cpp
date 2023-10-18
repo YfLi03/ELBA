@@ -212,10 +212,6 @@ exchange_kmer(const DnaBuffer& myreads,
         }
     }
 
-    for (int i = 0; i < ntasks; i++) {
-        (*recv_kmerseeds)[i].reserve(task_seedcnt[i]);
-    }
-
     kmerseeds.clear();
 
     #if LOG_LEVEL >= 3
@@ -242,6 +238,10 @@ exchange_kmer(const DnaBuffer& myreads,
     #endif
 
     vector<uint8_t>().swap(sendbuf);    /* release the memory of sendbuf */
+
+    for (int i = 0; i < ntasks; i++) {
+        (*recv_kmerseeds)[i].reserve(task_seedcnt[i]);
+    }
 
     uint8_t *addrs2read = recvbuf.data();
 
