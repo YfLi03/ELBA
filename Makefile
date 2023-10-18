@@ -46,6 +46,7 @@ OBJECTS=obj/Logger.o \
 		obj/KmerOps.o \
 		obj/SharedSeeds.o \
 		obj/Overlap.o \
+		obj/MemoryChecker.o \
 		obj/PairwiseAlignment.o \
 		obj/XDropAligner.o \
 		obj/TransitiveReduction.o \
@@ -88,6 +89,7 @@ obj/PruneChimeras.o: src/PruneChimeras.cpp include/PruneChimeras.hpp
 obj/DnaSeq.o: src/DnaSeq.cpp include/DnaSeq.hpp
 obj/DnaBuffer.o: src/DnaBuffer.cpp include/DnaBuffer.hpp
 obj/HashFuncs.o: src/HashFuncs.cpp include/HashFuncs.hpp
+obj/MemoryChecker.o: src/MemoryChecker.cpp include/MemoryChecker.hpp
 
 obj/CommGrid.o: $(COMBBLAS_SRC)/CommGrid.cpp $(COMBBLAS_INC)/CommGrid.h
 	@echo CXX -c -o $@ $<

@@ -3,6 +3,7 @@
 #include "DnaSeq.hpp"
 #include "MPITimer.hpp"
 #include "ParadisSort.hpp"
+#include "MemoryChecker.hpp"
 #include <cstring>
 #include <numeric>
 #include <algorithm>
@@ -76,6 +77,8 @@ exchange_kmer(const DnaBuffer& myreads,
 
     #if LOG_LEVEL >= 3
     timer.stop_and_log("K-mer partioning");
+    print_mem_log(nprocs, myrank, "After partitioning");
+
     timer.start();
     #endif
 
@@ -86,6 +89,8 @@ exchange_kmer(const DnaBuffer& myreads,
             kmerseeds[j].insert(kmerseeds[j].end(), kmerseeds_vecs[i][j].begin(), kmerseeds_vecs[i][j].end());
         }
     }
+
+    kmerseeds_vecs.clear();     /* Since it's a vec<vec<>> thing, clearing the outer one is enough */
 
     #if LOG_LEVEL >= 3
     timer.stop_and_log("K-mer copying");
@@ -211,8 +216,11 @@ exchange_kmer(const DnaBuffer& myreads,
         (*recv_kmerseeds)[i].reserve(task_seedcnt[i]);
     }
 
+    kmerseeds.clear();
+
     #if LOG_LEVEL >= 3
     timer.stop_and_log("K-mer packing");
+    print_mem_log(nprocs, myrank, "After packing");
     timer.start();
     #endif
 
@@ -224,6 +232,7 @@ exchange_kmer(const DnaBuffer& myreads,
 
     #if LOG_LEVEL >= 3
     timer.stop_and_log("MPI_Alltoall exchange");
+    print_mem_log(nprocs, myrank, "After MPI_Alltoall exchange");
     timer.start();
     #endif
 
@@ -231,6 +240,8 @@ exchange_kmer(const DnaBuffer& myreads,
     logger() << "received a total of " << numkmerseeds << " valid 'row' k-mers in ALLTOALL exchange";
     logger.Flush("K-mers received:");
     #endif
+
+    vector<uint8_t>().swap(sendbuf);    /* release the memory of sendbuf */
 
     uint8_t *addrs2read = recvbuf.data();
 
@@ -252,6 +263,7 @@ exchange_kmer(const DnaBuffer& myreads,
 
     #if LOG_LEVEL >= 3
     timer.stop_and_log("K-mer stored into local data structure");
+    print_mem_log(nprocs, myrank, "After storing");
     #endif
 
     return std::unique_ptr<KmerSeedBuckets>(recv_kmerseeds);
