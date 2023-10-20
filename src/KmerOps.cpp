@@ -42,7 +42,7 @@ exchange_kmer(const DnaBuffer& myreads,
     /* for memory bounded operations in this stage, we use another number of threads */
     int nthr_membounded = std::min(omp_get_max_threads() , max_thr_membounded);
 
-    std::vector<std::vector<KmerSeed>> kmerseeds(nprocs * ntasks);
+    std::vector<std::vector<KmerSeedStruct>> kmerseeds(nprocs * ntasks);
     size_t numreads = myreads.size();     /* Number of locally stored reads */
 
     #if LOG_LEVEL >= 2
@@ -62,9 +62,9 @@ exchange_kmer(const DnaBuffer& myreads,
     if (!myrank) readoffset = 0;    
 
     /* prepare the vars for each task */
-    std::vector<std::vector<std::vector<KmerSeed>>> kmerseeds_vecs;    
+    std::vector<std::vector<std::vector<KmerSeedStruct>>> kmerseeds_vecs;    
     for (int i = 0; i < nthr_membounded; i++ ) {
-        kmerseeds_vecs.push_back(std::vector<std::vector<KmerSeed>>(nprocs * ntasks));
+        kmerseeds_vecs.push_back(std::vector<std::vector<KmerSeedStruct>>(nprocs * ntasks));
     }
 
     std::vector<KmerParserHandler> parser_vecs;
@@ -113,10 +113,7 @@ exchange_kmer(const DnaBuffer& myreads,
         timer.start();
         #endif
 
-        #pragma omp parallel for num_threads(nthr_membounded)
-        for (int i = 0; i < ntasks; i++) {
-            (*recv_kmerseeds)[i].insert((*recv_kmerseeds)[i].end(), kmerseeds[i].begin(), kmerseeds[i].end());
-        }
+        (*recv_kmerseeds).swap(kmerseeds);
 
         #if LOG_LEVEL >= 3
         timer.stop_and_log("Local K-mer format conversion (nprocs == 1) ");
@@ -170,6 +167,7 @@ exchange_kmer(const DnaBuffer& myreads,
     if ( max_send_global * seedbytes > send_limit ) {
         logger.Flush("Warning:\
             \n\tSize of data exceeding the limit of int.\
+            \n\tMPI operations may suffer speed loss.\
             \n\tUsing MPI version 4 , or increase the number of nodes is recommended.");
     }
 
@@ -200,9 +198,9 @@ exchange_kmer(const DnaBuffer& myreads,
             for (uint64_t k = 0; k < kmerseeds[(size_t)i * ntasks + j].size(); k++ )
             {
                 auto& seeditr = kmerseeds[(size_t)i * ntasks + j][k];
-                TKmer kmer = std::get<0>(seeditr);
-                ReadId readid = std::get<1>(seeditr);
-                PosInRead pos = std::get<2>(seeditr);
+                TKmer kmer = seeditr.kmer;
+                ReadId readid = seeditr.readid;
+                PosInRead pos = seeditr.posinread;
                 memcpy(addrs2fill, kmer.GetBytes(), TKmer::NBYTES);
                 memcpy(addrs2fill + TKmer::NBYTES, &readid, sizeof(ReadId));
                 memcpy(addrs2fill + TKmer::NBYTES + sizeof(ReadId), &pos, sizeof(PosInRead));
@@ -317,9 +315,10 @@ filter_kmer(std::unique_ptr<KmerSeedBuckets>& recv_kmerseeds, std::shared_ptr<Co
         int tid = omp_get_thread_num();
         paradis::sort<KmerSeedStruct, TKmer::NBYTES>((*recv_kmerseeds)[tid].data(), (*recv_kmerseeds)[tid].data() + task_seedcnt[tid], thr_per_task);
     
+
     #if LOG_LEVEL >= 3
     }
-    // yfli: this barrier can be removed after we make sure the sorting is correct and analyzed the performance
+    /* this implicit barrier can be eliminated when not debugging */
     timer.stop_and_log("Shared memory parallel K-mer sorting");
     timer.start();
     #pragma omp parallel

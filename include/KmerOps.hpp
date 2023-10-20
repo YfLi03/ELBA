@@ -16,7 +16,7 @@ typedef  int64_t ReadId;
 
 typedef std::array<PosInRead, UPPER_KMER_FREQ> POSITIONS;
 typedef std::array<ReadId,    UPPER_KMER_FREQ> READIDS;
-typedef std::tuple<TKmer, ReadId, PosInRead> KmerSeed;
+// typedef std::tuple<TKmer, ReadId, PosInRead> KmerSeed;
 
 typedef std::tuple<TKmer, READIDS, POSITIONS, int> KmerListEntry;
 typedef std::vector<KmerListEntry> KmerList;
@@ -33,7 +33,7 @@ struct KmerSeedStruct{
 
     KmerSeedStruct(TKmer kmer, ReadId readid, PosInRead posinread) : kmer(kmer), readid(readid), posinread(posinread) {};
     KmerSeedStruct(const KmerSeedStruct& o) : kmer(o.kmer), readid(o.readid), posinread(o.posinread) {};
-    KmerSeedStruct(const KmerSeed& o) : kmer(std::get<0>(o)), readid(std::get<1>(o)), posinread(std::get<2>(o)) {};
+    // KmerSeedStruct(const KmerSeed& o) : kmer(std::get<0>(o)), readid(std::get<1>(o)), posinread(std::get<2>(o)) {};
     KmerSeedStruct(KmerSeedStruct&& o) :    // yfli: Not sure if it's appropriate to use std::move() here
         kmer(std::move(o.kmer)), readid(std::move(o.readid)), posinread(std::move(o.posinread)) {};
     KmerSeedStruct() {};
@@ -194,9 +194,9 @@ struct KmerParserHandler
 {
     int nprocs;
     ReadId readoffset;
-    std::vector<std::vector<KmerSeed>>& kmerseeds;
+    std::vector<std::vector<KmerSeedStruct>>& kmerseeds;
 
-    KmerParserHandler(std::vector<std::vector<KmerSeed>>& kmerseeds, ReadId readoffset) : nprocs(kmerseeds.size()), readoffset(readoffset), kmerseeds(kmerseeds) {}
+    KmerParserHandler(std::vector<std::vector<KmerSeedStruct>>& kmerseeds, ReadId readoffset) : nprocs(kmerseeds.size()), readoffset(readoffset), kmerseeds(kmerseeds) {}
 
     void operator()(const TKmer& kmer, size_t kid, size_t rid)
     {
