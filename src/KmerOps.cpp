@@ -132,8 +132,9 @@ exchange_kmer(const DnaBuffer& myreads,
     std::vector<uint64_t> task_seedcnt(ntasks);                                 /* number of kmer seeds for each local task in total */
     std::vector<uint64_t> sendcnt(nprocs);                                      /* number of kmer seeds sending to each process */
     std::vector<uint64_t> sthrcnt(nprocs * ntasks), rthrcnt(nprocs * ntasks);   /* number of kmer seeds for each global task (sending/reciving) */
-    uint64_t max_send = 0, max_send_global = 0, total_buf = 0;   
-    uint64_t send_limit = std::numeric_limits<MPI_Count_type>::max() / nprocs;               
+    uint64_t max_send = 0, max_send_global = 0;
+    uint64_t total_buf = 0;                                                     /* total sneding size in BYTES */
+    uint64_t send_limit = std::numeric_limits<MPI_Count_type>::max() / nprocs;      
 
     constexpr size_t seedbytes = TKmer::NBYTES + sizeof(ReadId) + sizeof(PosInRead);
 
@@ -166,8 +167,7 @@ exchange_kmer(const DnaBuffer& myreads,
     // yfli: not sure it's the total send cnt that matter, or the seperate one
     if ( max_send_global * seedbytes > send_limit ) {
         logger.Flush("Warning:\
-            \n\tSize of data exceeding the limit of int.\
-            \n\tMPI operations may suffer speed loss.\
+            \n\tSize of data exceeding the limit of int. Sending in batches.\
             \n\tUsing MPI version 4 , or increase the number of nodes is recommended.");
     }
 
@@ -218,50 +218,37 @@ exchange_kmer(const DnaBuffer& myreads,
     timer.start();
     #endif
 
-    std::vector<uint8_t> recvbuf(total_buf, 0);
-
-    /* compared to the MPI_ALLTOALLV, MPI_ALLTOALL is faster when we have more data to send */
-    BatchSender bsender(commgrid, max_send_global * seedbytes, send_limit, sendbuf.data(), recvbuf.data());
-    bsender.send_all();
-
-    #if LOG_LEVEL >= 3
-    timer.stop_and_log("MPI_Alltoall exchange");
-    print_mem_log(nprocs, myrank, "After MPI_Alltoall exchange");
-    timer.start();
-    #endif
-
-    #if LOG_LEVEL >= 2
-    logger() << "received a total of " << numkmerseeds << " valid 'row' k-mers in ALLTOALL exchange";
-    logger.Flush("K-mers received:");
-    #endif
-
-    vector<uint8_t>().swap(sendbuf);    /* release the memory of sendbuf */
-
+//    std::vector<uint8_t> recvbuf(total_buf, 0);
     for (int i = 0; i < ntasks; i++) {
         (*recv_kmerseeds)[i].reserve(task_seedcnt[i]);
     }
 
-    uint8_t *addrs2read = recvbuf.data();
+    /* compared to the MPI_ALLTOALLV, MPI_ALLTOALL is faster when we have more data to send */
+    BatchSender bsender(commgrid, max_send_global * seedbytes, send_limit, sendbuf.data(), seedbytes);
+    BatchStorer bstorer(*recv_kmerseeds, seedbytes, ntasks, nprocs, rthrcnt.data());
 
-    for (size_t i = 0; i < nprocs; i++)
-    {
-        addrs2read = recvbuf.data() + i * max_send_global * seedbytes;
-        for (size_t j = 0; j < ntasks; j++){
+    bsender.init();
+    int round = 0;
 
-            for (size_t k = 0; k < rthrcnt[ i * ntasks + j ]; k++ ){
-                ReadId readid = *((ReadId*)(addrs2read + TKmer::NBYTES));
-                PosInRead pos = *((PosInRead*)(addrs2read + TKmer::NBYTES + sizeof(ReadId)));
-                TKmer kmer((void*)addrs2read);
-                (*recv_kmerseeds)[j].push_back(KmerSeedStruct(kmer, readid, pos));
-                addrs2read += seedbytes;
-            }
-        }
-        
+    while(bsender.get_status() != BatchSender::Status::BATCH_DONE) {
+        round += 1;
+
+        size_t recv_sz = bsender.progress();
+        uint8_t* recvbuf = bsender.get_recvbuf();
+        assert(recv_sz != 0);
+
+        #if LOG_LEVEL >= 3
+        logger() << "received a total of " << recv_sz / seedbytes * nprocs << "  'row' k-mers (may include padding) in ALLTOALL exchange round "<<round;
+        logger.Flush("K-mers received:");
+        #endif
+
+        bstorer.store(recvbuf, recv_sz);
     }
 
+
     #if LOG_LEVEL >= 3
-    timer.stop_and_log("K-mer stored into local data structure");
-    print_mem_log(nprocs, myrank, "After storing");
+    timer.stop_and_log("K-mer exchange and storing");
+    print_mem_log(nprocs, myrank, "After storing (not deleting buffers)");
     #endif
 
     return std::unique_ptr<KmerSeedBuckets>(recv_kmerseeds);

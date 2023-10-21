@@ -86,6 +86,7 @@ filter_kmer(std::unique_ptr<KmerSeedBuckets>& recv_kmerseeds,
 
 int GetKmerOwner(const TKmer& kmer, int nprocs);
 
+/*
 struct BatchState
 {
     std::shared_ptr<CommGrid> commgrid;
@@ -110,47 +111,198 @@ struct BatchState
         return bool(alldone);
     }
 };
+*/
 
-struct BatchSender
+class BatchSender
 {
-    std::shared_ptr<CommGrid> commgrid;
-    size_t bytes_per_proc;
-    size_t send_threshold;
-    uint8_t* sendbuf;
-    uint8_t* recvbuf;
-
-    BatchSender(std::shared_ptr<CommGrid> commgrid, size_t bytes_per_proc, size_t send_threshold, uint8_t* sendbuf, uint8_t* recvbuf) : commgrid(commgrid), bytes_per_proc(bytes_per_proc), send_threshold(send_threshold), sendbuf(sendbuf), recvbuf(recvbuf) {}
-
-    void send_all()
+public:
+    enum Status
     {
-        int nprocs = commgrid->GetSize();
-        int myrank = commgrid->GetRank();
+        BATCH_NOT_INIT = 0,
+        BATCH_SENDING = 1,
+        BATCH_DONE = 2
+    };
 
-        if ( bytes_per_proc <= send_threshold ) {
-            MPI_ALLTOALL(sendbuf, bytes_per_proc, MPI_BYTE, recvbuf, bytes_per_proc, MPI_BYTE, commgrid->GetWorld());
+private:
+    std::shared_ptr<CommGrid> commgrid;
+    int nprocs;
+    int myrank;
+
+    Status status;
+    MPI_Request req;
+
+    size_t bytes_per_proc;
+    size_t batch_sz;        /* batch size in bytes */
+    size_t next_loc;        /* next location for sending */
+    size_t current_sz;      /* current valid size of the recvbuf */
+
+    uint8_t* sendbuf;
+
+    /* x is always the one that is currently sending, y is the one that can be used */
+    uint8_t* sendtmp_x;
+    uint8_t* recvtmp_x;
+    uint8_t* sendtmp_y;
+    uint8_t* recvtmp_y;
+
+
+public:
+
+    BatchSender(std::shared_ptr<CommGrid> commgrid, size_t bytes_per_proc, size_t batch_size, uint8_t* sendbuf, size_t seedbytes) : 
+        commgrid(commgrid), bytes_per_proc(bytes_per_proc), 
+        batch_sz(batch_size), sendbuf(sendbuf), status(BATCH_NOT_INIT),
+        next_loc(0), current_sz(0)
+    {
+        batch_sz = std::min(batch_sz, bytes_per_proc);
+        if (batch_sz % seedbytes != 0) {
+            batch_sz = (batch_sz / seedbytes) * seedbytes;
+        }
+
+        nprocs = commgrid->GetSize();
+        myrank = commgrid->GetRank();
+
+        /* one send tmp buf should be enough. I'm using two anyway. */
+        sendtmp_x = new uint8_t[batch_sz * nprocs];
+        recvtmp_x = new uint8_t[batch_sz * nprocs];
+
+        sendtmp_y = nullptr;
+        recvtmp_y = nullptr;
+    };
+
+    ~BatchSender()  
+    {
+        if (sendtmp_x != nullptr) delete[] sendtmp_x;
+        if (recvtmp_y != nullptr) delete[] recvtmp_x;
+        if (sendtmp_y != nullptr) delete[] sendtmp_y;
+        if (recvtmp_y != nullptr) delete[] recvtmp_y;
+        
+    }
+
+    // constructor (the vars, strategy)
+    // destructor (delete the tmp buffers)
+    // init (init the tmp buffers, start first sending)
+    // progress (wait for last send to complete and start next send if necessary)
+
+    Status get_status() { return status; }
+
+    uint8_t* get_recvbuf() { return recvtmp_y; }
+
+    void init()
+    {
+        status = BATCH_SENDING;
+
+        if (bytes_per_proc <= batch_sz) {
+            MPI_Ialltoall(sendbuf, bytes_per_proc, MPI_BYTE, recvtmp_x, bytes_per_proc, MPI_BYTE, commgrid->GetWorld(), &req);
+            next_loc = bytes_per_proc;
+            current_sz = bytes_per_proc;
             return;
         }
-        int times = (bytes_per_proc - 1) / send_threshold + 1;
 
-        uint8_t* sendtmp = new uint8_t[send_threshold * nprocs];
-        uint8_t* recvtmp = new uint8_t[send_threshold * nprocs];
+        sendtmp_y = new uint8_t[batch_sz * nprocs];
+        recvtmp_y = new uint8_t[batch_sz * nprocs];
 
-        for(int i = 0; i < times; i++){
-            MPI_Count_type send_size = std::min(send_threshold, bytes_per_proc - i * send_threshold);
-            
-            for(int j = 0; j < nprocs; j++){
-                memcpy(sendtmp + j * send_size, sendbuf + i * send_threshold + j * bytes_per_proc, send_size);
-            }
-
-            MPI_ALLTOALL(sendtmp, send_size, MPI_BYTE, recvtmp, send_size, MPI_BYTE, commgrid->GetWorld());
-
-            for(int j = 0; j < nprocs; j++){
-                memcpy(recvbuf + i * send_threshold + j * bytes_per_proc, recvtmp + j * send_size, send_size);
-            }
+        for (int i = 0; i < nprocs; i++) {
+            memcpy(sendtmp_x + batch_sz * i, sendbuf + bytes_per_proc * i, batch_sz);
         }
 
-        delete[] sendtmp;
-        delete[] recvtmp;
+        MPI_Ialltoall(sendtmp_x, batch_sz, MPI_BYTE, recvtmp_x, batch_sz, MPI_BYTE, commgrid->GetWorld(), &req);
+        next_loc = batch_sz;
+        current_sz = batch_sz;
+    }
+
+    size_t progress() {
+        if (status != BATCH_SENDING) return 0;
+
+        MPI_Wait(&req, MPI_STATUS_IGNORE);
+
+        std::swap(sendtmp_x, sendtmp_y);
+        std::swap(recvtmp_x, recvtmp_y);
+
+        if (myrank==0){
+            std::cout<<(size_t)sendtmp_x<<" "<<(size_t)sendtmp_y<<std::endl;
+            std::cout<<(size_t)recvtmp_x<<" "<<(size_t)recvtmp_y<<std::endl;
+        }
+
+        // send completed
+        if (next_loc >= bytes_per_proc) {
+            status = BATCH_DONE;
+            return current_sz;
+        }
+
+        // send not completed
+
+        // this can happen at the beginning to overlap more, but it'll be more complex
+        size_t send_size = std::min(batch_sz, bytes_per_proc - next_loc);
+        for (int i = 0; i < nprocs; i++) {
+            memcpy(sendtmp_x + i * send_size, sendbuf + next_loc + i * bytes_per_proc, send_size);
+        }
+
+        MPI_Ialltoall(sendtmp_x, send_size, MPI_BYTE, recvtmp_x, send_size, MPI_BYTE, commgrid->GetWorld(), &req);
+        next_loc += send_size;
+        size_t lsize = current_sz;
+        current_sz = send_size;
+
+        return lsize;
+    }
+};
+
+struct BatchStorer
+{
+    KmerSeedBuckets& kmerseeds;
+    int taskcnt, nprocs;
+    size_t seedbytes;
+    size_t* expected_recvcnt;
+    size_t* recvcnt;
+    int* recv_task_id;
+
+    BatchStorer(KmerSeedBuckets& kmerseeds, size_t seedbytes, int taskcnt, int nprocs, size_t* expected_recvcnt) : 
+        kmerseeds(kmerseeds), seedbytes(seedbytes), taskcnt(taskcnt), nprocs(nprocs), expected_recvcnt(expected_recvcnt)
+        {
+            recvcnt = new size_t[nprocs];
+            recv_task_id = new int[nprocs];
+            memset(recvcnt, 0, sizeof(size_t) * nprocs);
+            memset(recv_task_id, 0, sizeof(int) * nprocs);
+        }
+
+    ~BatchStorer()
+    {
+        
+        delete[] recvcnt;
+        delete[] recv_task_id;
+        
+    }
+
+    void store(uint8_t* recvbuf, size_t recv_size)
+    {
+        for(int i = 0; i < nprocs; i++) 
+        {
+            if (recv_task_id[i] >= taskcnt) continue;
+            int working_task = recv_task_id[i];
+            size_t cnt = recvcnt[i];
+            size_t max_cnt = expected_recvcnt[ taskcnt * i + working_task ];
+
+            uint8_t* addrs2read = recvbuf + recv_size * i;
+
+            for (size_t j = 0; j < recv_size / seedbytes; j++) {
+
+                TKmer kmer((void*)addrs2read);                
+                ReadId readid = *((ReadId*)(addrs2read + TKmer::NBYTES));
+                PosInRead pos = *((PosInRead*)(addrs2read + TKmer::NBYTES + sizeof(ReadId)));
+                kmerseeds[working_task].emplace_back(kmer, readid, pos);
+
+                addrs2read += seedbytes;
+                cnt++;
+                if (cnt >= max_cnt) {
+                    recv_task_id[i]++;
+                    if (recv_task_id[i] >= taskcnt) break;
+                    working_task++;
+                    cnt = 0;
+                    max_cnt = expected_recvcnt[ taskcnt * i + working_task ];
+                }
+
+            }
+            recvcnt[i] = cnt;
+
+        }
     }
 };
 
@@ -168,7 +320,7 @@ struct KmerEstimateHandler
         hll.add(s.c_str());
     }
 };
-*/
+
 
 struct KmerPartitionHandler
 {
@@ -189,6 +341,8 @@ struct KmerPartitionHandler
         state.mymaxsending = std::max(kmerbucket.size(), state.mymaxsending);
     }
 };
+*/
+
 
 struct KmerParserHandler
 {
@@ -275,7 +429,7 @@ void ForeachKmerParallel(const DnaBuffer& myreads, std::vector<KmerHandler>& han
     }
 }
 
-
+/*
 template <typename KmerHandler>
 void ForeachKmer(const DnaBuffer& myreads, KmerHandler& handler, BatchState& state)
 {
@@ -303,5 +457,5 @@ void ForeachKmer(const DnaBuffer& myreads, KmerHandler& handler, BatchState& sta
         }
     }
 }
-
+*/
 #endif // ELBA_KMEROPS_HPP
