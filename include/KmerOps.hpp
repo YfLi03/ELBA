@@ -3,6 +3,7 @@
 
 #include "common.h"
 #include "Kmer.hpp"
+#include "MPITimer.hpp"
 #include "DnaSeq.hpp"
 #include "DnaBuffer.hpp"
 
@@ -22,10 +23,18 @@ typedef std::tuple<TKmer, READIDS, POSITIONS, int> KmerListEntry;
 typedef std::vector<KmerListEntry> KmerList;
 
 #define DEFAULT_THREAD_PER_TASK 4
-#define MAX_THREAD_MEMORY_BOUNDED 16
+#define MAX_THREAD_MEMORY_BOUNDED 4
+#define MAX_THREAD_MEMORY_BOUNDED_EXTREME 2
+#define MAX_SEND_BATCH 10000000
 
-/* yfli: This struct stores the same information as KmerSeed */
-/* I need this struct because the GetByte() member function is necessary for sorting */
+/* 
+ * Some explanations about these vars:
+ * it's suggested to set number of MPI ranks per nodes as the count of NUMA nodes
+ * under such setting, the memory bandwidth is not shared between MPI ranks
+ * MAX_THREAD_MEMORY_BOUNDED_EXTREME is the count of memory controller per NUMA node ( for perlmutter, it is 2 )
+ */
+
+
 struct KmerSeedStruct{
     TKmer kmer;      
     ReadId readid;
@@ -217,11 +226,6 @@ public:
         std::swap(sendtmp_x, sendtmp_y);
         std::swap(recvtmp_x, recvtmp_y);
 
-        if (myrank==0){
-            std::cout<<(size_t)sendtmp_x<<" "<<(size_t)sendtmp_y<<std::endl;
-            std::cout<<(size_t)recvtmp_x<<" "<<(size_t)recvtmp_y<<std::endl;
-        }
-
         // send completed
         if (next_loc >= bytes_per_proc) {
             status = BATCH_DONE;
@@ -395,14 +399,14 @@ template <typename KmerHandler>
 void ForeachKmerParallel(const DnaBuffer& myreads, std::vector<KmerHandler>& handlers, int nthreads)
 {
     assert(nthreads > 0);
-
     /*
      * Go through each local read.
      */
 
     // yfli: TODO: test the performance of different number of threads. This might be a memory bandwidth issue.
 
-    #pragma omp parallel for num_threads(nthreads)
+    /* cosidering the NUMA effect, we may want the vecs to be NUMA-local*/
+    #pragma omp parallel for num_threads(nthreads) 
     for (size_t i = 0; i < myreads.size(); ++i)
     {
         int tid = omp_get_thread_num();

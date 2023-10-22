@@ -32,18 +32,19 @@ exchange_kmer(const DnaBuffer& myreads,
     Logger logger(commgrid);
     std::ostringstream rootlog;
 
+    /* parallel settings */
     omp_set_nested(1);
     int ntasks = omp_get_max_threads() / thr_per_task;
     if (ntasks < 1) {
         ntasks = 1;
         thr_per_task = omp_get_max_threads();
     }
-
     /* for memory bounded operations in this stage, we use another number of threads */
     int nthr_membounded = std::min(omp_get_max_threads() , max_thr_membounded);
 
-    std::vector<std::vector<KmerSeedStruct>> kmerseeds(nprocs * ntasks);
     size_t numreads = myreads.size();     /* Number of locally stored reads */
+    // !! There may be a bug with large file and small rank num. in this case myread can read things wrong, resulting in 
+    // !! Kmers with all A and C.
 
     #if LOG_LEVEL >= 2
     logger() << ntasks << " \t (thread per task: " << thr_per_task << ")";
@@ -82,28 +83,8 @@ exchange_kmer(const DnaBuffer& myreads,
     timer.start();
     #endif
 
-    /* merge the seed vecs into one for each task*/
-    #pragma omp parallel for num_threads(nthr_membounded)
-    for (int j = 0; j < nprocs * ntasks; j++) {
-        for (int i = 0; i < nthr_membounded; i++) {
-            kmerseeds[j].insert(kmerseeds[j].end(), kmerseeds_vecs[i][j].begin(), kmerseeds_vecs[i][j].end());
-        }
-    }
+    KmerSeedBuckets* recv_kmerseeds = new KmerSeedBuckets(ntasks);
 
-    kmerseeds_vecs.clear();     /* Since it's a vec<vec<>> thing, clearing the outer one is enough */
-
-    #if LOG_LEVEL >= 3
-    timer.stop_and_log("K-mer copying");
-    #endif
-
-    /* 
-     * yfli:
-     * generally speaking, for efficiency of MPI,
-     * it's suggested to use 1 process per node for 1 node,
-     * and 4 process per node for more than 1 node
-     */
-    KmerSeedBuckets* recv_kmerseeds = new KmerSeedBuckets;
-    recv_kmerseeds->resize(ntasks);
 
     if (nprocs == 1){
         // yfli: we're definitely wasting some time here
@@ -113,7 +94,13 @@ exchange_kmer(const DnaBuffer& myreads,
         timer.start();
         #endif
 
-        (*recv_kmerseeds).swap(kmerseeds);
+        #pragma omp parallel for num_threads(nthr_membounded)
+        for (int j = 0; j < nprocs * ntasks; j++) {
+            for (int i = 0; i < nthr_membounded; i++) {
+                (*recv_kmerseeds)[j].insert((*recv_kmerseeds)[j].end(), kmerseeds_vecs[i][j].begin(), kmerseeds_vecs[i][j].end());
+            }
+        }
+        
 
         #if LOG_LEVEL >= 3
         timer.stop_and_log("Local K-mer format conversion (nprocs == 1) ");
@@ -135,6 +122,7 @@ exchange_kmer(const DnaBuffer& myreads,
     uint64_t max_send = 0, max_send_global = 0;
     uint64_t total_buf = 0;                                                     /* total sneding size in BYTES */
     uint64_t send_limit = std::numeric_limits<MPI_Count_type>::max() / nprocs;      
+    send_limit = std::min(send_limit, (uint64_t)MAX_SEND_BATCH);
 
     constexpr size_t seedbytes = TKmer::NBYTES + sizeof(ReadId) + sizeof(PosInRead);
 
@@ -144,9 +132,13 @@ exchange_kmer(const DnaBuffer& myreads,
 
     for (int i = 0; i < nprocs; ++i)
     {
-        for (int j = 0; j < ntasks; j++) {
-            sendcnt[i] += kmerseeds[i * ntasks + j].size();
-            sthrcnt[i * ntasks + j] = kmerseeds[i * ntasks + j].size();
+        for (int j = 0; j < ntasks; j++) 
+        {
+            for (int k = 0; k < nthr_membounded; k++)
+            {
+                sendcnt[i] += kmerseeds_vecs[k][i * ntasks + j].size();
+                sthrcnt[i * ntasks + j] += kmerseeds_vecs[k][i * ntasks + j].size();
+            }
         }
         
         #if LOG_LEVEL >= 2
@@ -166,9 +158,7 @@ exchange_kmer(const DnaBuffer& myreads,
 
     // yfli: not sure it's the total send cnt that matter, or the seperate one
     if ( max_send_global * seedbytes > send_limit ) {
-        logger.Flush("Warning:\
-            \n\tSize of data exceeding the limit of int. Sending in batches.\
-            \n\tUsing MPI version 4 , or increase the number of nodes is recommended.");
+        logger.Flush("Sending in Batches");
     }
 
     /* calculate the offset for each task */
@@ -188,29 +178,30 @@ exchange_kmer(const DnaBuffer& myreads,
     // yfli: we're doing many times of redandant memcpy here actually, maybe try avoid this if performance is not good
     std::vector<uint8_t> sendbuf(total_buf, 0);
 
-    # pragma omp parallel for num_threads(nthr_membounded)
-    for (int i = 0; i < nprocs; i++ )
-    {
-        uint8_t *addrs2fill = sendbuf.data() + i * max_send_global * seedbytes;
+    # pragma omp parallel for num_threads(MAX_THREAD_MEMORY_BOUNDED_EXTREME)
+    for (int proc = 0; proc < nprocs; proc++ ) {
+        uint8_t *addrs2fill = sendbuf.data() + proc * max_send_global * seedbytes;
         /* padding is done for processes but not tasks */
 
-        for (int j = 0; j < ntasks; j++ ) {
-            for (uint64_t k = 0; k < kmerseeds[(size_t)i * ntasks + j].size(); k++ )
-            {
-                auto& seeditr = kmerseeds[(size_t)i * ntasks + j][k];
-                TKmer kmer = seeditr.kmer;
-                ReadId readid = seeditr.readid;
-                PosInRead pos = seeditr.posinread;
-                memcpy(addrs2fill, kmer.GetBytes(), TKmer::NBYTES);
-                memcpy(addrs2fill + TKmer::NBYTES, &readid, sizeof(ReadId));
-                memcpy(addrs2fill + TKmer::NBYTES + sizeof(ReadId), &pos, sizeof(PosInRead));
-                addrs2fill += seedbytes;
+        for (int task = 0; task < ntasks; task++ ) {
+            for(int i = 0; i < nthr_membounded; i++) {
+                size_t sz = kmerseeds_vecs[i][proc * ntasks + task].size();
+                for (size_t k = 0; k < sz; k++ ) {
+                    auto& seeditr = kmerseeds_vecs[i][proc * ntasks + task][k];
+                    TKmer kmer = seeditr.kmer;
+                    ReadId readid = seeditr.readid;
+                    PosInRead pos = seeditr.posinread;
+                    memcpy(addrs2fill, kmer.GetBytes(), TKmer::NBYTES);
+                    memcpy(addrs2fill + TKmer::NBYTES, &readid, sizeof(ReadId));
+                    memcpy(addrs2fill + TKmer::NBYTES + sizeof(ReadId), &pos, sizeof(PosInRead));
+                    addrs2fill += seedbytes;
+                }
             }
-            kmerseeds[(size_t)i * ntasks + j].clear();
+
         }
     }
 
-    kmerseeds.clear();
+    kmerseeds_vecs.clear();
 
     #if LOG_LEVEL >= 3
     timer.stop_and_log("K-mer packing");
