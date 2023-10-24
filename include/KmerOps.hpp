@@ -17,21 +17,21 @@ typedef  int64_t ReadId;
 
 typedef std::array<PosInRead, UPPER_KMER_FREQ> POSITIONS;
 typedef std::array<ReadId,    UPPER_KMER_FREQ> READIDS;
-// typedef std::tuple<TKmer, ReadId, PosInRead> KmerSeed;
 
 typedef std::tuple<TKmer, READIDS, POSITIONS, int> KmerListEntry;
 typedef std::vector<KmerListEntry> KmerList;
 
 #define DEFAULT_THREAD_PER_TASK 4
-#define MAX_THREAD_MEMORY_BOUNDED 4
+#define MAX_THREAD_MEMORY_BOUNDED 8
 #define MAX_THREAD_MEMORY_BOUNDED_EXTREME 2
-#define MAX_SEND_BATCH 10000000
+#define MAX_SEND_BATCH 1000000
 
 /* 
- * Some explanations about these vars:
+ * Some explanations about these vars and recommended settings:
  * it's suggested to set number of MPI ranks per nodes as the count of NUMA nodes
  * under such setting, the memory bandwidth is not shared between MPI ranks
  * MAX_THREAD_MEMORY_BOUNDED_EXTREME is the count of memory controller per NUMA node ( for perlmutter, it is 2 )
+ * For thr other vars, i don't have a good explanation for them currently
  */
 
 
@@ -94,33 +94,6 @@ filter_kmer(std::unique_ptr<KmerSeedBuckets>& recv_kmerseeds,
 
 
 int GetKmerOwner(const TKmer& kmer, int nprocs);
-
-/*
-struct BatchState
-{
-    std::shared_ptr<CommGrid> commgrid;
-    size_t mynumreads;
-    size_t memthreshold;
-    size_t mykmerssofar;
-    size_t mymaxsending;
-    ReadId myreadid;
-
-    BatchState(size_t mynumreads, std::shared_ptr<CommGrid> commgrid) : commgrid(commgrid), mynumreads(mynumreads), memthreshold((MAX_ALLTOALL_MEM / commgrid->GetSize()) << 1), mykmerssofar(0), mymaxsending(0), myreadid(0) {}
-
-    bool ReachedThreshold(const size_t len)
-    {
-        return (mymaxsending * TKmer::NBYTES >= memthreshold || (mykmerssofar + len) * TKmer::NBYTES >= MAX_ALLTOALL_MEM);
-    }
-
-    bool Finished() const
-    {
-        int alldone;
-        int imdone = !!(myreadid >= static_cast<ReadId>(mynumreads));
-        MPI_Allreduce(&imdone, &alldone, 1, MPI_INT, MPI_LAND, commgrid->GetWorld());
-        return bool(alldone);
-    }
-};
-*/
 
 class BatchSender
 {
@@ -310,44 +283,6 @@ struct BatchStorer
     }
 };
 
-// may need that in the future
-/*
-struct KmerEstimateHandler
-{
-    HyperLogLog& hll;
-
-    KmerEstimateHandler(HyperLogLog& hll) : hll(hll) {}
-
-    void operator()(const TKmer& kmer, size_t kid, size_t rid)
-    {
-        auto s = kmer.GetString();
-        hll.add(s.c_str());
-    }
-};
-
-
-struct KmerPartitionHandler
-{
-    int nthreads_tot;
-    std::vector<std::vector<TKmer>>& kmerbuckets;
-
-    KmerPartitionHandler(std::vector<std::vector<TKmer>>& kmerbuckets) : nthreads_tot(kmerbuckets.size()), kmerbuckets(kmerbuckets) {}
-
-    void operator()(const TKmer& kmer, size_t kid, size_t rid)
-    {
-        kmerbuckets[GetKmerOwner(kmer, nthreads_tot)].push_back(kmer);
-    }
-
-    void operator()(const TKmer& kmer, BatchState& state, size_t kid)
-    {
-        auto& kmerbucket = kmerbuckets[GetKmerOwner(kmer, nthreads_tot)];
-        kmerbucket.push_back(kmer);
-        state.mymaxsending = std::max(kmerbucket.size(), state.mymaxsending);
-    }
-};
-*/
-
-
 struct KmerParserHandler
 {
     int nprocs;
@@ -433,33 +368,4 @@ void ForeachKmerParallel(const DnaBuffer& myreads, std::vector<KmerHandler>& han
     }
 }
 
-/*
-template <typename KmerHandler>
-void ForeachKmer(const DnaBuffer& myreads, KmerHandler& handler, BatchState& state)
-{
-    for (; state.myreadid < static_cast<ReadId>(myreads.size()); state.myreadid++)
-    {
-        const DnaSeq& sequence = myreads[state.myreadid];
-
-        if (sequence.size() < KMER_SIZE)
-            continue;
-
-        std::vector<TKmer> repmers = TKmer::GetRepKmers(sequence);
-        state.mykmerssofar += repmers.size();
-
-        size_t j = 0;
-
-        for (auto meritr = repmers.begin(); meritr != repmers.end(); ++meritr, ++j)
-        {
-            handler(*meritr, state, j);
-        }
-
-        if (state.ReachedThreshold(sequence.size()))
-        {
-            state.myreadid++;
-            return;
-        }
-    }
-}
-*/
 #endif // ELBA_KMEROPS_HPP

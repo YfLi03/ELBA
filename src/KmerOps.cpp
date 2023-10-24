@@ -74,10 +74,17 @@ exchange_kmer(const DnaBuffer& myreads,
         parser_vecs.push_back(KmerParserHandler(kmerseeds_vecs[i], static_cast<ReadId>(readoffset)));
     }
 
+    #pragma omp parallel for num_threads(nthr_membounded)
+    for (int i = 0; i < nthr_membounded; i++) {
+        for(int j = 0; j < nprocs * ntasks; j++) {
+            kmerseeds_vecs[i][j].reserve(size_t(1.1 * numreads / nprocs / ntasks / nthr_membounded));
+        }
+    }
+
     ForeachKmerParallel(myreads, parser_vecs, nthr_membounded);
 
     #if LOG_LEVEL >= 3
-    timer.stop_and_log("K-mer partioning");
+    timer.stop_and_log("K-mer partitioning");
     print_mem_log(nprocs, myrank, "After partitioning");
 
     timer.start();
@@ -111,10 +118,6 @@ exchange_kmer(const DnaBuffer& myreads,
     } 
 
     /* more than 1 process, need MPI communication */
-
-    #if LOG_LEVEL >= 3
-    timer.start();
-    #endif
 
     std::vector<uint64_t> task_seedcnt(ntasks);                                 /* number of kmer seeds for each local task in total */
     std::vector<uint64_t> sendcnt(nprocs);                                      /* number of kmer seeds sending to each process */
@@ -177,6 +180,10 @@ exchange_kmer(const DnaBuffer& myreads,
     /* preparing the sending buffer */
     // yfli: we're doing many times of redandant memcpy here actually, maybe try avoid this if performance is not good
     std::vector<uint8_t> sendbuf(total_buf, 0);
+
+    #if LOG_LEVEL >= 3
+    timer.start();
+    #endif
 
     # pragma omp parallel for num_threads(MAX_THREAD_MEMORY_BOUNDED_EXTREME)
     for (int proc = 0; proc < nprocs; proc++ ) {
