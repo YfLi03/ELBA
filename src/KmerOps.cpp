@@ -63,7 +63,7 @@ exchange_kmer(const DnaBuffer& myreads,
     if (!myrank) readoffset = 0;    
 
     /* prepare the vars for each task */
-    std::vector<std::vector<std::vector<KmerSeedStruct>>> kmerseeds_vecs;    
+    KmerSeedVecs kmerseeds_vecs;    
     for (int i = 0; i < nthr_membounded; i++ ) {
         kmerseeds_vecs.push_back(std::vector<std::vector<KmerSeedStruct>>(nprocs * ntasks));
     }
@@ -86,16 +86,12 @@ exchange_kmer(const DnaBuffer& myreads,
     #if LOG_LEVEL >= 3
     timer.stop_and_log("K-mer partitioning");
     print_mem_log(nprocs, myrank, "After partitioning");
-
     timer.start();
     #endif
 
     KmerSeedBuckets* recv_kmerseeds = new KmerSeedBuckets(ntasks);
 
-
     if (nprocs == 1){
-        // yfli: we're definitely wasting some time here
-        // consider switching to the KMerSeedStruct completely
 
         #if LOG_LEVEL >= 3
         timer.start();
@@ -120,17 +116,14 @@ exchange_kmer(const DnaBuffer& myreads,
     /* more than 1 process, need MPI communication */
 
     std::vector<uint64_t> task_seedcnt(ntasks);                                 /* number of kmer seeds for each local task in total */
-    std::vector<uint64_t> sendcnt(nprocs);                                      /* number of kmer seeds sending to each process */
     std::vector<uint64_t> sthrcnt(nprocs * ntasks), rthrcnt(nprocs * ntasks);   /* number of kmer seeds for each global task (sending/reciving) */
-    uint64_t max_send = 0, max_send_global = 0;
-    uint64_t total_buf = 0;                                                     /* total sneding size in BYTES */
-    uint64_t send_limit = std::numeric_limits<MPI_Count_type>::max() / nprocs;      
-    send_limit = std::min(send_limit, (uint64_t)MAX_SEND_BATCH);
+    uint64_t batch_sz = std::numeric_limits<MPI_Count_type>::max() / nprocs;      
+    batch_sz = std::min(batch_sz, (uint64_t)MAX_SEND_BATCH);
 
     constexpr size_t seedbytes = TKmer::NBYTES + sizeof(ReadId) + sizeof(PosInRead);
 
     #if LOG_LEVEL >= 2
-    logger() << std::setprecision(4) << "sending 'row' k-mers to each processor in this amount (megabytes): {";
+    logger() << std::setprecision(4) << "sending 'row' k-mers to each processor in this amount : {";
     #endif
 
     for (int i = 0; i < nprocs; ++i)
@@ -139,13 +132,16 @@ exchange_kmer(const DnaBuffer& myreads,
         {
             for (int k = 0; k < nthr_membounded; k++)
             {
-                sendcnt[i] += kmerseeds_vecs[k][i * ntasks + j].size();
                 sthrcnt[i * ntasks + j] += kmerseeds_vecs[k][i * ntasks + j].size();
             }
+
+            #if LOG_LEVEL >= 2
+            logger() << sthrcnt[i * ntasks + j]  << "+";
+            #endif
         }
-        
+
         #if LOG_LEVEL >= 2
-        logger() << (static_cast<double>(sendcnt[i]) * seedbytes / (1024 * 1024)) << ",";
+        logger() << ", ";
         #endif
     }
 
@@ -153,16 +149,6 @@ exchange_kmer(const DnaBuffer& myreads,
     logger() << "}";
     logger.Flush("K-mer exchange sendcounts:");
     #endif
-
-    /* exchange the send/recv cnt information to prepare for data transfer */
-    max_send = *std::max_element(sendcnt.begin(), sendcnt.end());
-    MPI_Allreduce(&max_send, &max_send_global, 1, MPI_UNSIGNED_LONG_LONG, MPI_MAX, commgrid->GetWorld());
-    total_buf = max_send_global * nprocs * seedbytes;
-
-    // yfli: not sure it's the total send cnt that matter, or the seperate one
-    if ( max_send_global * seedbytes > send_limit ) {
-        logger.Flush("Sending in Batches");
-    }
 
     /* calculate the offset for each task */
     MPI_ALLTOALL(sthrcnt.data(), ntasks, MPI_UNSIGNED_LONG_LONG, rthrcnt.data(), ntasks, MPI_UNSIGNED_LONG_LONG, commgrid->GetWorld());
@@ -177,53 +163,13 @@ exchange_kmer(const DnaBuffer& myreads,
     }
     assert(numkmerseeds == std::accumulate(task_seedcnt.begin(), task_seedcnt.end(), (uint64_t)0));
 
-    /* preparing the sending buffer */
-    // yfli: we're doing many times of redandant memcpy here actually, maybe try avoid this if performance is not good
-    std::vector<uint8_t> sendbuf(total_buf, 0);
-
-    #if LOG_LEVEL >= 3
-    timer.start();
-    #endif
-
-    # pragma omp parallel for num_threads(MAX_THREAD_MEMORY_BOUNDED_EXTREME)
-    for (int proc = 0; proc < nprocs; proc++ ) {
-        uint8_t *addrs2fill = sendbuf.data() + proc * max_send_global * seedbytes;
-        /* padding is done for processes but not tasks */
-
-        for (int task = 0; task < ntasks; task++ ) {
-            for(int i = 0; i < nthr_membounded; i++) {
-                size_t sz = kmerseeds_vecs[i][proc * ntasks + task].size();
-                for (size_t k = 0; k < sz; k++ ) {
-                    auto& seeditr = kmerseeds_vecs[i][proc * ntasks + task][k];
-                    TKmer kmer = seeditr.kmer;
-                    ReadId readid = seeditr.readid;
-                    PosInRead pos = seeditr.posinread;
-                    memcpy(addrs2fill, kmer.GetBytes(), TKmer::NBYTES);
-                    memcpy(addrs2fill + TKmer::NBYTES, &readid, sizeof(ReadId));
-                    memcpy(addrs2fill + TKmer::NBYTES + sizeof(ReadId), &pos, sizeof(PosInRead));
-                    addrs2fill += seedbytes;
-                }
-            }
-
-        }
-    }
-
-    kmerseeds_vecs.clear();
-
-    #if LOG_LEVEL >= 3
-    timer.stop_and_log("K-mer packing");
-    print_mem_log(nprocs, myrank, "After packing");
-    timer.start();
-    #endif
-
-//    std::vector<uint8_t> recvbuf(total_buf, 0);
     for (int i = 0; i < ntasks; i++) {
         (*recv_kmerseeds)[i].reserve(task_seedcnt[i]);
     }
 
-    /* compared to the MPI_ALLTOALLV, MPI_ALLTOALL is faster when we have more data to send */
-    BatchSender bsender(commgrid, max_send_global * seedbytes, send_limit, sendbuf.data(), seedbytes);
-    BatchStorer bstorer(*recv_kmerseeds, seedbytes, ntasks, nprocs, rthrcnt.data());
+    /* Sending in batches using Alltoall instead of Alltoallv */
+    BatchSender bsender(commgrid, ntasks, nthr_membounded, batch_sz, kmerseeds_vecs);
+    BatchStorer bstorer(*recv_kmerseeds, ntasks, nprocs, rthrcnt.data(), batch_sz);
 
     bsender.init();
     int round = 0;
@@ -231,21 +177,16 @@ exchange_kmer(const DnaBuffer& myreads,
     while(bsender.get_status() != BatchSender::Status::BATCH_DONE) {
         round += 1;
 
-        size_t recv_sz = bsender.progress();
-        uint8_t* recvbuf = bsender.get_recvbuf();
-        assert(recv_sz != 0);
-
-        #if LOG_LEVEL >= 3
-        logger() << "received a total of " << recv_sz / seedbytes * nprocs << "  'row' k-mers (may include padding) in ALLTOALL exchange round "<<round;
-        logger.Flush("K-mers received:");
-        #endif
-
-        bstorer.store(recvbuf, recv_sz);
+        uint8_t* recvbuf = bsender.progress();
+        assert(recvbuf != nullptr);
+        bstorer.store(recvbuf);
     }
 
-
     #if LOG_LEVEL >= 3
-    timer.stop_and_log("K-mer exchange and storing");
+    std::ostringstream ss;
+    ss << "K-mer exchange and storing (rounds: " << round << ", batch size: " << batch_sz << ")";
+    timer.stop_and_log(ss.str().c_str());
+    ss.clear();
     print_mem_log(nprocs, myrank, "After storing (not deleting buffers)");
     #endif
 
