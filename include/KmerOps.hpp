@@ -132,7 +132,7 @@ private:
     uint8_t* recvtmp_y;
 
     /* encode and write a kmerseed to the current buffer address */
-    void encode_kmerseed(uint8_t* &addr, KmerSeedStruct& kmerseed) {
+    void encode_kmerseed_basic(uint8_t* &addr, KmerSeedStruct& kmerseed) {
 
         TKmer kmer = kmerseed.kmer;
         ReadId readid = kmerseed.readid;
@@ -145,12 +145,71 @@ private:
         addr += (sizeof(TKmer) + sizeof(ReadId) + sizeof(PosInRead));
     }
 
+    /* encoder vars */
+    ReadId last_readid;
+    PosInRead last_posinread;
+
+    void init_encoder() {
+        last_readid = 0;
+        last_posinread = 0;
+    }
+
+    void encode_kmerseed(uint8_t* &addr, KmerSeedStruct& kmerseed) {
+
+        TKmer kmer = kmerseed.kmer;
+        ReadId readid = kmerseed.readid;
+        PosInRead pos = kmerseed.posinread;
+
+        memcpy(addr, kmer.GetBytes(), TKmer::NBYTES);
+
+        int c = 0;
+        if (readid == last_readid) {
+            if (pos > last_posinread && pos - last_posinread < (2 << 14))
+                c = 3;
+            else
+                c = 2;
+        } else if (readid == last_readid + 1) {
+            c = 1;
+        };
+
+        // the following code will online work for little endian machines
+        switch (c) {
+            case 0:
+                pos = pos << 2;
+                memcpy(addr + TKmer::NBYTES, &pos, sizeof(PosInRead));
+                memcpy(addr + TKmer::NBYTES + sizeof(PosInRead), &readid, sizeof(ReadId));
+                addr += (sizeof(TKmer) + sizeof(ReadId) + sizeof(PosInRead));
+                break;
+            case 1:
+                pos = (pos << 2) + 1;
+                memcpy(addr + TKmer::NBYTES, &pos, sizeof(PosInRead));
+                addr += (sizeof(TKmer) + sizeof(PosInRead));
+                break;
+            case 2:
+                pos = (pos << 2) + 2;
+                memcpy(addr + TKmer::NBYTES, &pos, sizeof(PosInRead));
+                addr += (sizeof(TKmer) + sizeof(PosInRead));
+                break;
+            case 3:
+                uint16_t pos16 = ((pos - last_posinread) << 2) + 3;
+                memcpy(addr + TKmer::NBYTES, &pos16, sizeof(uint16_t));
+                addr += (sizeof(TKmer) + sizeof(uint16_t));
+                break;
+        }
+
+        last_readid = readid;
+        last_posinread = pos;
+
+    }
+
     /* 
      * Write sendbuf for a process. returns if it has completed 
      * This function is also responsible for determining the vector to read from
      * Returns if all data has been sent (for this process)
      */
     bool write_sendbuf(uint8_t* addr, int procid) {
+
+        init_encoder();
         size_t task = loc_task[procid];
         size_t thr = loc_thr[procid];
         size_t idx = loc_idx[procid];
@@ -190,11 +249,11 @@ private:
 
         bool finished = true;
 
-        #pragma omp parallel for num_threads(MAX_THREAD_MEMORY_BOUNDED)
+        // #pragma omp parallel for num_threads(4)
         for(int i = 0; i < nprocs; i++) {
             bool myfinished = write_sendbuf(addr + batch_sz * i, i);
             
-            #pragma omp critical
+            // #pragma omp critical
             {
                 if (!myfinished) finished = false;
             }
@@ -260,12 +319,6 @@ public:
 
     }
 
-    // constructor (the vars, strategy)
-    // destructor (delete the tmp buffers)
-    // init (init the tmp buffers, start first sending)
-    // progress (wait for last send to complete and start next send if necessary)
-
-
     Status get_status() { return status; }
 
     void init()
@@ -285,11 +338,17 @@ public:
         timer.start();
         #endif
 
+        write_sendbufs(sendtmp_y);
+
+        #if LOG_LEVEL >= 3
+        timer.stop_and_log("write_sendbufs");
+        timer.start();
+        #endif
+
         MPI_Wait(&req, MPI_STATUS_IGNORE);
 
         #if LOG_LEVEL >= 3
         timer.stop_and_log("MPI_Wait");
-        timer.start();
         #endif
 
         std::swap(sendtmp_x, sendtmp_y);
@@ -308,13 +367,6 @@ public:
             return recvtmp_y;
         }
 
-        // send not completed. maybe overlap this?
-
-        write_sendbufs(sendtmp_x);
-
-        #if LOG_LEVEL >= 3
-        timer.stop_and_log("write_sendbufs");
-        #endif
 
         MPI_Ialltoall(sendtmp_x, batch_sz, MPI_BYTE, recvtmp_x, batch_sz, MPI_BYTE, commgrid->GetWorld(), &req);
         return recvtmp_y;
@@ -333,12 +385,60 @@ class BatchStorer
     int* recv_task_id;
 
     /* it should be inlined by default */
-    inline void decode(uint8_t* &addr, std::vector<KmerSeedStruct> &kmerseeds) {
+    inline void decode_basic(uint8_t* &addr, std::vector<KmerSeedStruct> &kmerseeds) {
         TKmer kmer((void*)addr);                
         ReadId readid = *((ReadId*)(addr + TKmer::NBYTES));
         PosInRead pos = *((PosInRead*)(addr + TKmer::NBYTES + sizeof(ReadId)));
         kmerseeds.emplace_back(kmer, readid, pos);
         addr += TKmer::NBYTES + sizeof(ReadId) + sizeof(PosInRead);
+    }
+
+    /* decoder vars */
+    ReadId last_readid;
+    PosInRead last_posinread;
+
+    void init_decoder() {
+        last_readid = 0;
+        last_posinread = 0;
+    }
+
+    inline void decode(uint8_t* &addr, std::vector<KmerSeedStruct> &kmerseeds) {
+        TKmer kmer((void*)addr);
+        
+        uint8_t c = *((uint8_t*)(addr + TKmer::NBYTES));
+        c = c & 0x03;
+
+        ReadId readid = 0;
+        PosInRead pos = 0;
+
+        switch (c) {
+            case 0:
+                pos = (*((PosInRead*)(addr + TKmer::NBYTES))) >> 2;
+                readid = *((ReadId*)(addr + TKmer::NBYTES + sizeof(PosInRead)));
+                addr += (sizeof(TKmer) + sizeof(ReadId) + sizeof(PosInRead));
+                break;
+            case 1:
+                pos = (*((PosInRead*)(addr + TKmer::NBYTES))) >> 2;
+                readid = last_readid + 1;
+                addr += (sizeof(TKmer) + sizeof(PosInRead));
+                break;
+            case 2:
+                pos = (*((PosInRead*)(addr + TKmer::NBYTES))) >> 2;
+                readid = last_readid;
+                addr += (sizeof(TKmer) + sizeof(PosInRead));
+                break;
+            case 3:
+                uint16_t pos16 = *((uint16_t*)(addr + TKmer::NBYTES));
+                pos = (pos16 >> 2) + last_posinread;
+                readid = last_readid;
+                addr += (sizeof(TKmer) + sizeof(uint16_t));
+                break;
+        }
+
+        kmerseeds.emplace_back(kmer, readid, pos);
+
+        last_readid = readid;
+        last_posinread = pos;
     }
 
 public:
@@ -369,6 +469,7 @@ public:
 
         for(int i = 0; i < nprocs; i++) 
         {
+            init_decoder();
             if (recv_task_id[i] >= taskcnt) continue;      // all data for this task has been received. all the rest is padding
             int working_task = recv_task_id[i];
             size_t cnt = recvcnt[i];
