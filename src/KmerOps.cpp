@@ -188,6 +188,7 @@ exchange_kmer(const DnaBuffer& myreads,
     timer.stop_and_log(ss.str().c_str());
     ss.clear();
     print_mem_log(nprocs, myrank, "After storing (not deleting buffers)");
+    bsender.print_results(logger);
     #endif
 
     return std::unique_ptr<KmerSeedBuckets>(recv_kmerseeds);

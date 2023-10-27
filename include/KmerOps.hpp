@@ -154,6 +154,8 @@ private:
         last_posinread = 0;
     }
 
+    int ca = 0, cb = 0, cc = 0, cd = 0;
+    
     void encode_kmerseed(uint8_t* &addr, KmerSeedStruct& kmerseed) {
 
         TKmer kmer = kmerseed.kmer;
@@ -162,9 +164,9 @@ private:
 
         memcpy(addr, kmer.GetBytes(), TKmer::NBYTES);
 
-        int c = 0;
+        char c = 0;
         if (readid == last_readid) {
-            if (pos > last_posinread && pos - last_posinread < (2 << 14))
+            if (pos > last_posinread && pos - last_posinread < (2 << 16))
                 c = 3;
             else
                 c = 2;
@@ -172,28 +174,32 @@ private:
             c = 1;
         };
 
-        // the following code will online work for little endian machines
         switch (c) {
             case 0:
-                pos = pos << 2;
-                memcpy(addr + TKmer::NBYTES, &pos, sizeof(PosInRead));
-                memcpy(addr + TKmer::NBYTES + sizeof(PosInRead), &readid, sizeof(ReadId));
-                addr += (sizeof(TKmer) + sizeof(ReadId) + sizeof(PosInRead));
+                memcpy(addr + TKmer::NBYTES, &c, sizeof(char));
+                memcpy(addr + TKmer::NBYTES + sizeof(char), &pos, sizeof(PosInRead));
+                memcpy(addr + TKmer::NBYTES + sizeof(char) + sizeof(PosInRead), &readid, sizeof(ReadId));
+                addr += (sizeof(TKmer) + sizeof(char) + sizeof(ReadId) + sizeof(PosInRead));
+                ca++;
                 break;
             case 1:
-                pos = (pos << 2) + 1;
-                memcpy(addr + TKmer::NBYTES, &pos, sizeof(PosInRead));
-                addr += (sizeof(TKmer) + sizeof(PosInRead));
+                memcpy(addr + TKmer::NBYTES, &c, sizeof(char));
+                memcpy(addr + TKmer::NBYTES + sizeof(char), &pos, sizeof(PosInRead));
+                addr += (sizeof(TKmer) + sizeof(char) + sizeof(PosInRead));
+                cb++;
                 break;
             case 2:
-                pos = (pos << 2) + 2;
-                memcpy(addr + TKmer::NBYTES, &pos, sizeof(PosInRead));
-                addr += (sizeof(TKmer) + sizeof(PosInRead));
+                memcpy(addr + TKmer::NBYTES, &c, sizeof(char));
+                memcpy(addr + TKmer::NBYTES + sizeof(char), &pos, sizeof(PosInRead));
+                addr += (sizeof(TKmer) + sizeof(char) + sizeof(PosInRead));
+                cc++;
                 break;
             case 3:
-                uint16_t pos16 = ((pos - last_posinread) << 2) + 3;
-                memcpy(addr + TKmer::NBYTES, &pos16, sizeof(uint16_t));
-                addr += (sizeof(TKmer) + sizeof(uint16_t));
+                uint16_t pos16 = (uint16_t)(pos - last_posinread);
+                memcpy(addr + TKmer::NBYTES, &c, sizeof(char));
+                memcpy(addr + TKmer::NBYTES + sizeof(char), &pos16, sizeof(uint16_t));
+                addr += (sizeof(TKmer) + sizeof(char) + sizeof(uint16_t));
+                cd++;
                 break;
         }
 
@@ -273,6 +279,10 @@ private:
 
 public:
 
+    void print_results(Logger &l) {
+        l()<<ca<<" "<<cb<<" "<<cc<<" "<<cd<<std::endl;
+        l.Flush("compress results");
+    }
     BatchSender(std::shared_ptr<CommGrid> commgrid, size_t ntasks, size_t nthrs, size_t batch_size, KmerSeedVecs& kmerseeds) : 
         commgrid(commgrid), batch_sz(batch_size), kmerseeds(kmerseeds), status(BATCH_NOT_INIT), ntasks(ntasks), nthrs(nthrs)
     {
@@ -288,7 +298,7 @@ public:
          * The dst process know how many kmers we're sending, so it will limit the number of kmers it reads.
          */
 
-        send_limit = batch_sz - sizeof(char) - TKmer::NBYTES - sizeof(ReadId) - sizeof(PosInRead);
+        send_limit = batch_sz - sizeof(char) - TKmer::NBYTES - sizeof(ReadId) - sizeof(PosInRead) - sizeof(char);
 
         nprocs = commgrid->GetSize();
         myrank = commgrid->GetRank();
@@ -405,33 +415,33 @@ class BatchStorer
     inline void decode(uint8_t* &addr, std::vector<KmerSeedStruct> &kmerseeds) {
         TKmer kmer((void*)addr);
         
-        uint8_t c = *((uint8_t*)(addr + TKmer::NBYTES));
-        c = c & 0x03;
+        char c = *((char*)(addr + TKmer::NBYTES));
+        addr = addr + TKmer::NBYTES + sizeof(char);
 
         ReadId readid = 0;
         PosInRead pos = 0;
 
         switch (c) {
             case 0:
-                pos = (*((PosInRead*)(addr + TKmer::NBYTES))) >> 2;
-                readid = *((ReadId*)(addr + TKmer::NBYTES + sizeof(PosInRead)));
-                addr += (sizeof(TKmer) + sizeof(ReadId) + sizeof(PosInRead));
+                pos = (*((PosInRead*)(addr)));
+                readid = *((ReadId*)(addr + sizeof(PosInRead)));
+                addr += (sizeof(ReadId) + sizeof(PosInRead));
                 break;
             case 1:
-                pos = (*((PosInRead*)(addr + TKmer::NBYTES))) >> 2;
+                pos = (*((PosInRead*)(addr)));
                 readid = last_readid + 1;
-                addr += (sizeof(TKmer) + sizeof(PosInRead));
+                addr += (sizeof(PosInRead));
                 break;
             case 2:
-                pos = (*((PosInRead*)(addr + TKmer::NBYTES))) >> 2;
+                pos = (*((PosInRead*)(addr)));
                 readid = last_readid;
-                addr += (sizeof(TKmer) + sizeof(PosInRead));
+                addr += (sizeof(PosInRead));
                 break;
             case 3:
-                uint16_t pos16 = *((uint16_t*)(addr + TKmer::NBYTES));
-                pos = (pos16 >> 2) + last_posinread;
+                uint16_t pos16 = *((uint16_t*)(addr));
+                pos = last_posinread + pos16;
                 readid = last_readid;
-                addr += (sizeof(TKmer) + sizeof(uint16_t));
+                addr += (sizeof(uint16_t));
                 break;
         }
 
@@ -445,7 +455,7 @@ public:
     BatchStorer(KmerSeedBuckets& kmerseeds,  int taskcnt, int nprocs, size_t* expected_recvcnt, size_t batch_size) : 
         kmerseeds(kmerseeds), taskcnt(taskcnt), nprocs(nprocs), expected_recvcnt(expected_recvcnt), batch_size(batch_size)
         {
-            send_limit = batch_size - sizeof(char) - TKmer::NBYTES - sizeof(ReadId) - sizeof(PosInRead);
+            send_limit = batch_size - sizeof(char) - TKmer::NBYTES - sizeof(ReadId) - sizeof(PosInRead) - sizeof(char);
             recvcnt = new size_t[nprocs];
             recv_task_id = new int[nprocs];
             memset(recvcnt, 0, sizeof(size_t) * nprocs);
@@ -475,7 +485,7 @@ public:
             size_t cnt = recvcnt[i];
             size_t max_cnt = expected_recvcnt[ taskcnt * i + working_task ];
             uint8_t* addrs2read = recvbuf + batch_size * i;
-            uint8_t* addr_limit = addrs2read + batch_size - sizeof(char) - TKmer::NBYTES - sizeof(ReadId) - sizeof(PosInRead);
+            uint8_t* addr_limit = addrs2read + send_limit;
 
             while(addrs2read <= addr_limit && working_task < taskcnt) {
                 decode(addrs2read, kmerseeds[working_task]);
