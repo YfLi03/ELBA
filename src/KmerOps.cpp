@@ -4,33 +4,32 @@
 #include "MPITimer.hpp"
 #include "ParadisSort.hpp"
 #include "MemoryChecker.hpp"
+#include "Supermer.hpp"
+#include "compiletime.h"
 #include <cstring>
 #include <numeric>
 #include <algorithm>
 #include <iomanip>
 #include <cmath>
-#include <mpi.h>
 #include <omp.h>
+#include <mpi.h>
+#include <thread>
+#include <deque>
 
 
-std::unique_ptr<KmerSeedBuckets>
-exchange_kmer(const DnaBuffer& myreads,
-     std::shared_ptr<CommGrid> commgrid,
+ParallelData
+prepare_supermer(const DnaBuffer& myreads,
+     std::shared_ptr<CommGrid> comm,
      int thr_per_task,
      int max_thr_membounded)
 {
-    MPI_Comm comm = MPI_COMM_WORLD;
 
-    #if LOG_LEVEL >= 3
-    MPITimer timer(comm);
-    #endif
+    int myrank;
+    int nprocs;
+    myrank = comm->GetRank();
+    nprocs = comm->GetSize();
 
-    int myrank = commgrid->GetRank();
-    int nprocs = commgrid->GetSize();
-    bool single_node = (nprocs == 1);
-
-    Logger logger(commgrid);
-    std::ostringstream rootlog;
+    Logger logger(comm);
 
     /* parallel settings */
     omp_set_nested(1);
@@ -46,188 +45,113 @@ exchange_kmer(const DnaBuffer& myreads,
     // !! There may be a bug with large file and small rank num. in this case myread can read things wrong, resulting in 
     // !! Kmers with all A and C.
 
-    #if LOG_LEVEL >= 2
+
+#if LOG_LEVEL >= 2
     logger() << ntasks << " \t (thread per task: " << thr_per_task << ")";
     logger.Flush("Task num:");
     logger() << nthr_membounded ;
     logger.Flush("Thread count used for memory bounded operations:");
-    #endif
+#endif
 
-    #if LOG_LEVEL >= 3
+    size_t readoffset = numreads;      
+    MPI_Exscan(&numreads, &readoffset, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, comm->GetWorld());
+      
+
+    /* data structure for storing the data of different threads */
+    ParallelData data(nprocs, ntasks, nthr_membounded, readoffset);
+
+    /* find the destinations of each kmer */
+    FindKmerDestinationsParallel(myreads, nthr_membounded, ntasks*nprocs, data);
+
+#if LOG_LEVEL >= 3
+    timer.stop_and_log("(Inc) K-mer destination finding");
     timer.start();
-    #endif
+#endif
 
-    size_t readoffset = numreads;         // yfli: not sure if we need this initial value
-    if (!single_node)
-        MPI_Exscan(&numreads, &readoffset, 1, MPI_SIZE_T, MPI_SUM, commgrid->GetWorld());
-    if (!myrank) readoffset = 0;    
-
-    /* prepare the vars for each task */
-    KmerSeedVecs kmerseeds_vecs;    
-    for (int i = 0; i < nthr_membounded; i++ ) {
-        kmerseeds_vecs.push_back(std::vector<std::vector<KmerSeedStruct>>(nprocs * ntasks));
-    }
-
-    std::vector<KmerParserHandler> parser_vecs;
-    for (int i = 0; i < nthr_membounded; i++ ) {
-        /* This is a little bit tricky, as we need to avoid the kmerseeds_vecs from reallocating */
-        parser_vecs.push_back(KmerParserHandler(kmerseeds_vecs[i], static_cast<ReadId>(readoffset)));
-    }
-
-    #pragma omp parallel for num_threads(nthr_membounded)
-    for (int i = 0; i < nthr_membounded; i++) {
-        for(int j = 0; j < nprocs * ntasks; j++) {
-            kmerseeds_vecs[i][j].reserve(size_t(1.1 * numreads / nprocs / ntasks / nthr_membounded));
-        }
-    }
-
-    ForeachKmerParallel(myreads, parser_vecs, nthr_membounded);
-
-    #if LOG_LEVEL >= 3
-    timer.stop_and_log("K-mer partitioning");
-    print_mem_log(nprocs, myrank, "After partitioning");
-    timer.start();
-    #endif
-
-    KmerSeedBuckets* recv_kmerseeds = new KmerSeedBuckets(ntasks);
-
-    if (nprocs == 1){
-
-        #if LOG_LEVEL >= 3
-        timer.start();
-        #endif
-
-        #pragma omp parallel for num_threads(nthr_membounded)
-        for (int j = 0; j < nprocs * ntasks; j++) {
-            for (int i = 0; i < nthr_membounded; i++) {
-                (*recv_kmerseeds)[j].insert((*recv_kmerseeds)[j].end(), kmerseeds_vecs[i][j].begin(), kmerseeds_vecs[i][j].end());
-            }
-        }
-        
-
-        #if LOG_LEVEL >= 3
-        timer.stop_and_log("Local K-mer format conversion (nprocs == 1) ");
-        #endif
-
-        /* for 1 process, no MPI communication is necessary*/
-        return std::unique_ptr<KmerSeedBuckets>(recv_kmerseeds);
-    } 
-
-    /* more than 1 process, need MPI communication */
-
-    std::vector<uint64_t> task_seedcnt(ntasks);                                 /* number of kmer seeds for each local task in total */
-    std::vector<uint64_t> sthrcnt(nprocs * ntasks), rthrcnt(nprocs * ntasks);   /* number of kmer seeds for each global task (sending/reciving) */
-    std::vector<uint64_t> sprocnt(nprocs);                                      /* number of kmer seeds for each process */  
-    uint64_t batch_sz = std::numeric_limits<MPI_Count_type>::max() / nprocs;      
-    batch_sz = std::min(batch_sz, (uint64_t)MAX_SEND_BATCH);
-
-    constexpr size_t seedbytes = TKmer::NBYTES + sizeof(ReadId) + sizeof(PosInRead);
-
-    #if LOG_LEVEL >= 2
-    logger() << std::setprecision(4) << "sending 'row' k-mers to each processor in this amount : {";
-    #endif
-
-    for (int i = 0; i < nprocs; ++i)
+    /* encode the supermers */
+    #pragma omp parallel num_threads(nthr_membounded)
     {
-        for (int j = 0; j < ntasks; j++) 
-        {
-            for (int k = 0; k < nthr_membounded; k++)
-            {
-                sthrcnt[i * ntasks + j] += kmerseeds_vecs[k][i * ntasks + j].size();
-            }
+        int tid = omp_get_thread_num();
+        auto& lengths = data.get_my_lengths(tid);
+        auto& supermers = data.get_my_supermers(tid);
+        auto& destinations = data.get_my_destinations(tid);
+        auto& readids = data.get_my_readids(tid);
 
-            sprocnt[i] += sthrcnt[i * ntasks + j];
+        SupermerEncoder encoder(lengths, supermers, readoffset, MAX_SUPERMER_LEN);
+
+        for (size_t i = 0; i < readids.size(); ++i) {
+            encoder.encode(destinations[i], myreads[readids[i]], readids[i] + readoffset);
         }
 
-
-
-        #if LOG_LEVEL >= 2
-        logger() << sprocnt[i] << ", ";
-        #endif
     }
-
-    #if LOG_LEVEL >= 2
-    logger() << "}";
-    logger.Flush("K-mer exchange sendcounts:");
-    #endif
-
-     /* Calculate and sync the batch size 
-      *
-      * It is extremely slow if the batch size is relatively large,
-      * compared to the total amount of information to be sent. 
-      * I haven't found out the reason yet, 
-      * But limit the batch size to a reasonable value solves this problem and 
-      * is a good practice anyway.
-      */
-    size_t max_send_proc = *std::max_element(sprocnt.begin(), sprocnt.end());
-    max_send_proc = max_send_proc * seedbytes / 5;
-
-    MPI_Allreduce(MPI_IN_PLACE, &max_send_proc, 1, MPI_UNSIGNED_LONG_LONG, MPI_MAX, comm);
-    if (max_send_proc < batch_sz) batch_sz = max_send_proc;
-
-    #if LOG_LEVEL >= 3
-    logger() << "batch size: " << batch_sz;
-    logger.flush("K-mer exchange batch size:");
-    #endif
-
-    /* calculate the offset for each task */
-    MPI_ALLTOALL(sthrcnt.data(), ntasks, MPI_UNSIGNED_LONG_LONG, rthrcnt.data(), ntasks, MPI_UNSIGNED_LONG_LONG, commgrid->GetWorld());
-
-    /* calculate how many kmer seeds each thread will receive */
-    size_t numkmerseeds = std::accumulate(rthrcnt.begin(), rthrcnt.end(), (uint64_t)0);
-
-    for (int i = 0; i < ntasks; i++) {
-        for (int j = 0; j < nprocs; j++) {
-            task_seedcnt[i] += rthrcnt[j * ntasks + i];
-        }
-    }
-    assert(numkmerseeds == std::accumulate(task_seedcnt.begin(), task_seedcnt.end(), (uint64_t)0));
-
-    for (int i = 0; i < ntasks; i++) {
-        (*recv_kmerseeds)[i].reserve(task_seedcnt[i]);
-    }
-
-    /* Sending in batches using Alltoall instead of Alltoallv */
-    BatchSender bsender(commgrid, ntasks, nthr_membounded, batch_sz, kmerseeds_vecs);
-    BatchStorer bstorer(*recv_kmerseeds, ntasks, nprocs, rthrcnt.data(), batch_sz);
-
-    bsender.init();
-    int round = 0;
-
-    while(bsender.get_status() != BatchSender::Status::BATCH_DONE) {
-        round += 1;
-
-        uint8_t* recvbuf = bsender.progress();
-        assert(recvbuf != nullptr);
-        bstorer.store(recvbuf);
-    }
-
-    #if LOG_LEVEL >= 3
-    std::ostringstream ss;
-    ss << "K-mer exchange and storing (rounds: " << round << ", batch size: " << batch_sz << ")";
-    timer.stop_and_log(ss.str().c_str());
-    ss.clear();
-    print_mem_log(nprocs, myrank, "After storing (not deleting buffers)");
-    bsender.print_results(logger);
-    #endif
-
-    return std::unique_ptr<KmerSeedBuckets>(recv_kmerseeds);
+    return data;
 }
 
 
+
+std::unique_ptr<KmerSeedBuckets> exchange_supermer(ParallelData& data, std::shared_ptr<CommGrid> comm)
+{
+    int myrank;
+    int nprocs;
+    myrank = comm->GetRank();
+    nprocs = comm->GetSize();
+    Logger logger(comm);
+
+    int ntasks = data.ntasks;
+
+    std::vector<size_t> send_counts(nprocs * ntasks, 0);
+    std::vector<size_t> recv_counts(nprocs * ntasks, 0);
+
+    for (int i = 0; i < nprocs; i++) {
+        for (int j = 0; j < ntasks; j++) 
+            send_counts[i * ntasks + j] = data.get_supermer_cnt(i, j);
+    }
+
+    MPI_Alltoall(send_counts.data(), ntasks, MPI_UNSIGNED_LONG_LONG, recv_counts.data(), ntasks, MPI_UNSIGNED_LONG_LONG, comm->GetWorld());
+
+    std::vector<std::vector<uint32_t>> length;
+
+    LengthExchanger length_exchanger(comm->GetWorld(), ntasks, MAX_SEND_BATCH, sizeof(uint32_t), data.nthr_membounded, data.lengths, recv_counts, length);
+    length_exchanger.initialize();
+
+    while(length_exchanger.status != LengthExchanger::Status::BATCH_DONE) {
+        length_exchanger.progress();
+    }
+
+    KmerSeedBuckets* bucket = new KmerSeedBuckets(ntasks);
+    SupermerExchanger supermer_exchanger(comm->GetWorld(), ntasks, MAX_SEND_BATCH, MAX_SUPERMER_LEN + sizeof(ReadId) + sizeof(PosInRead), data.nthr_membounded, data.lengths, data.supermers, recv_counts, length, *bucket); 
+    
+    supermer_exchanger.initialize();
+    while (supermer_exchanger.status != SupermerExchanger::Status::BATCH_DONE)
+    {
+        supermer_exchanger.progress();
+    }
+
+#if LOG_LEVEL >= 3
+timer.stop_and_log("(Inc) Supermer exchange");
+supermer_exchanger.print_stats();
+#endif
+    
+
+    return std::unique_ptr<KmerSeedBuckets>(bucket);
+}
+
+
+
 std::unique_ptr<KmerList>
-filter_kmer(std::unique_ptr<KmerSeedBuckets>& recv_kmerseeds, std::shared_ptr<CommGrid> commgrid, int thr_per_task )
+filter_kmer(std::unique_ptr<KmerSeedBuckets>& recv_kmerseeds, 
+     std::shared_ptr<CommGrid> comm,
+     int thr_per_task)
 {
 
-    MPI_Comm comm = MPI_COMM_WORLD;
-    MPITimer timer(comm);
-
-    int myrank = commgrid->GetRank();
-    int nprocs = commgrid->GetSize();
-
-    Logger logger(commgrid);
+    Logger logger(comm);
+    int myrank;
+    int nprocs;
+    MPI_Comm_rank(MPI_COMM_WORLD, &myrank);
+    MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
     std::ostringstream rootlog;
 
+    /* determine how many threads to use for each task */
     int ntasks = omp_get_max_threads() / thr_per_task;
     if (ntasks < 1){
         ntasks = 1;
@@ -243,38 +167,29 @@ filter_kmer(std::unique_ptr<KmerSeedBuckets>& recv_kmerseeds, std::shared_ptr<Co
     uint64_t valid_kmer[ntasks];
     KmerList kmerlists[ntasks];
 
-    #if LOG_LEVEL >= 2
-    logger() <<"task num: "<< ntasks << " \tthread per task: " << thr_per_task <<" \ttask size: ";
+
     for (int i = 0; i < ntasks; i++) {
         task_seedcnt[i] = (*recv_kmerseeds)[i].size();
-        logger() << task_seedcnt[i] << " ";
     }
-    logger.Flush("Parallel tasks for kmer sorting and counting:");
-    #endif
-
-    #if LOG_LEVEL >= 3
-    timer.start();
-    #endif
-
-    // yfli: maybe ask omp to scatter the threads on different places
-    #pragma omp parallel 
-    {
-        int tid = omp_get_thread_num();
-        paradis::sort<KmerSeedStruct, TKmer::NBYTES>((*recv_kmerseeds)[tid].data(), (*recv_kmerseeds)[tid].data() + task_seedcnt[tid], thr_per_task);
     
 
-    #if LOG_LEVEL >= 3
-    }
-    /* this implicit barrier can be eliminated when not debugging */
-    timer.stop_and_log("Shared memory parallel K-mer sorting");
-    timer.start();
-    #pragma omp parallel
+    // distribute available threads to each task in according to number of tasks
+ //   int nthreads = omp_get_max_threads();
+  //  int total_seeds = std::accumulate(task_seedcnt, task_seedcnt + ntasks, (uint64_t)0);
+
+
+    /* sort the receiving vectors */
+    #pragma omp parallel 
     {
+
         int tid = omp_get_thread_num();
-    #endif
+//        int tasknum = std::max(1, (int)std::round((double)task_seedcnt[tid] * nthreads / total_seeds));
+        paradis::sort<KmerSeedStruct, TKmer::NBYTES>((*recv_kmerseeds)[tid].data(), (*recv_kmerseeds)[tid].data() + task_seedcnt[tid], thr_per_task);
 
 
-        kmerlists[tid].reserve(uint64_t(task_seedcnt[tid] / LOWER_KMER_FREQ));    // This should be enough
+        /* do a linear scan and filter out the kmers we want */
+        
+        kmerlists[tid].reserve(uint64_t(task_seedcnt[tid] / LOWER_KMER_FREQ));
         TKmer last_mer = (*recv_kmerseeds)[tid][0].kmer;
         uint64_t cur_kmer_cnt = 1;
         valid_kmer[tid] = 0;
@@ -310,7 +225,7 @@ filter_kmer(std::unique_ptr<KmerSeedBuckets>& recv_kmerseeds, std::shared_ptr<Co
             }
         }
 
-        /* deal with the last kmer */
+        /* deal with the last kmer of a task */
         if (cur_kmer_cnt >= LOWER_KMER_FREQ && cur_kmer_cnt <= UPPER_KMER_FREQ) {
             kmerlists[tid].push_back(KmerListEntry());
             KmerListEntry& entry         = kmerlists[tid].back();
@@ -332,17 +247,17 @@ filter_kmer(std::unique_ptr<KmerSeedBuckets>& recv_kmerseeds, std::shared_ptr<Co
         }
     }
 
-    #if LOG_LEVEL >= 3
+#if LOG_LEVEL >= 3
     timer.stop_and_log("K-mer counting");
     timer.start();
-    #endif
+#endif
 
-    #if LOG_LEVEL >= 2
+#if LOG_LEVEL >= 2
     for (int i = 0; i < ntasks; i++) {
         logger() << valid_kmer[i] << " ";
     }
     logger.Flush("Valid kmer from tasks:");
-    #endif
+#endif
 
 
     uint64_t valid_kmer_total = std::accumulate(valid_kmer, valid_kmer + ntasks, (uint64_t)0);
@@ -357,15 +272,56 @@ filter_kmer(std::unique_ptr<KmerSeedBuckets>& recv_kmerseeds, std::shared_ptr<Co
     logger() << valid_kmer_total;
     logger.Flush("Valid kmer for process:");
 
-    #if LOG_LEVEL >= 3
-    timer.stop_and_log("K-mer copying");
-    #endif
+#if LOG_LEVEL >= 3
+    timer.stop_and_log("(Inc) K-mer copying");
+#endif
 
     return std::unique_ptr<KmerList>(kmerlist);
 }
 
-int GetKmerOwner(const TKmer& kmer, int nprocs)
-{
+void FindKmerDestinationsParallel(const DnaBuffer& myreads, int nthreads, int tot_tasks, ParallelData& data) {
+    
+    assert(nthreads > 0);
+
+    #pragma omp parallel for num_threads(nthreads) schedule(static)
+    for (size_t i = 0; i < myreads.size(); ++i)
+    {
+        int tid = omp_get_thread_num();
+
+        auto &dest = data.register_new_destination(tid, i);
+        if (myreads[i].size() < KMER_SIZE)
+            continue;
+        dest.reserve(myreads[i].size() - KMER_SIZE + 1);
+
+        std::vector<TMmer> repmers = TMmer::GetRepMmers(myreads[i]);
+
+        Minimizer_Deque deque;
+        int head_pos = 0;
+
+        /* initialize the deque */
+        for(; head_pos < KMER_SIZE - MINIMIZER_SIZE; head_pos++) {
+            deque.insert_minimizer(repmers[head_pos].GetHash(), head_pos);
+        }
+        int tail_pos = head_pos - KMER_SIZE + MINIMIZER_SIZE - 1;
+
+        /* start the main loop */
+        for(; head_pos < repmers.size(); head_pos++, tail_pos++) {
+            deque.insert_minimizer(repmers[head_pos].GetHash(), head_pos);
+            deque.remove_minimizer(tail_pos);
+            dest.push_back(GetMinimizerOwner(deque.get_current_minimizer(), tot_tasks));
+        }
+
+    }
+}
+
+
+inline int GetMinimizerOwner(const uint64_t& hash, int tot_tasks) {
+    // Need to check if this gives equal distribution
+    return static_cast<int>(hash % tot_tasks);
+}
+
+
+inline int GetKmerOwner(const TKmer& kmer, int nprocs) {
     uint64_t myhash = kmer.GetHash();
     double range = static_cast<double>(myhash) * static_cast<double>(nprocs);
     size_t owner = range / std::numeric_limits<uint64_t>::max();

@@ -1,6 +1,7 @@
 #include "PairwiseAlignment.hpp"
 #include "DnaSeq.hpp"
 #include "Logger.hpp"
+#include <omp.h>
 
 std::unique_ptr<CT<Overlap>::PSpParMat>
 PairwiseAlignment(DistributedFastaData& dfd, CT<SharedSeeds>::PSpParMat& Bmat, int mat, int mis, int gap, int dropoff)
@@ -68,13 +69,39 @@ PairwiseAlignment(DistributedFastaData& dfd, CT<SharedSeeds>::PSpParMat& Bmat, i
     /*
      * Construct the overlap graph matrix by running alignments.
      */
+
     std::vector<int64_t> local_rowids, local_colids;
     std::vector<Overlap> overlaps;
 
     overlaps.reserve(nalignments);
 
+    std::vector<std::vector<int64_t>> t_local_rowids, t_local_colids;
+    std::vector<std::vector<Overlap>> t_overlaps;
+
+    int nthreads = omp_get_max_threads();
+    omp_set_num_threads(nthreads);
+    
+    t_local_rowids.resize(nthreads);
+    t_local_colids.resize(nthreads);
+    t_overlaps.resize(nthreads);
+
+    for ( size_t i = 0; i < nthreads; i++ )
+    {
+        t_local_rowids[i].reserve(nalignments / nthreads + 1);
+        t_local_colids[i].reserve(nalignments / nthreads + 1);
+        t_overlaps[i].reserve(nalignments / nthreads + 1);
+    }
+
+    #if LOG_LEVEL >= 2
+    logger() << "using " << nthreads << "threads";
+    logger.Flush("Thread Counts:");
+    #endif
+
+    #pragma omp parallel for
     for (size_t i = 0; i < nalignments; ++i)
     {
+        int tid = omp_get_thread_num();
+
         int64_t localrow = std::get<0>(alignseeds[i]);
         int64_t localcol = std::get<1>(alignseeds[i]);
 
@@ -87,11 +114,19 @@ PairwiseAlignment(DistributedFastaData& dfd, CT<SharedSeeds>::PSpParMat& Bmat, i
         std::tuple<PosInRead, PosInRead> len(lenQ, lenT);
 
         /* TODO: change the below two lines */
-        overlaps.emplace_back(len, std::get<2>(alignseeds[i])->getseeds()[0]);
-        overlaps.back().extend_overlap(seqQ, seqT, mat, mis, gap, dropoff);
+        t_overlaps[tid].emplace_back(len, std::get<2>(alignseeds[i])->getseeds()[0]);
+        t_overlaps[tid].back().extend_overlap(seqQ, seqT, mat, mis, gap, dropoff);
 
-        local_rowids.push_back(localrow + rowoffset);
-        local_colids.push_back(localcol + coloffset);
+        t_local_rowids[tid].push_back(localrow + rowoffset);
+        t_local_colids[tid].push_back(localcol + coloffset);
+    }
+
+    // merge the vectors
+    for ( size_t i = 0; i < nthreads; i++ )
+    {
+        local_rowids.insert(local_rowids.end(), t_local_rowids[i].begin(), t_local_rowids[i].end());
+        local_colids.insert(local_colids.end(), t_local_colids[i].begin(), t_local_colids[i].end());
+        overlaps.insert(overlaps.end(), t_overlaps[i].begin(), t_overlaps[i].end());
     }
 
     CT<int64_t>::PDistVec drows(local_rowids, commgrid);

@@ -27,6 +27,8 @@ target/
 cmake-build-debug/
 cmake-build-release/
 cmake-build-asan/
+seqan/
+include/seqan/
 # MSTest test Results
 [Tt]est[Rr]esult*/
 [Bb]uild[Ll]og.*

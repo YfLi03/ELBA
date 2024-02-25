@@ -100,8 +100,6 @@ int main(int argc, char **argv)
         std::unique_ptr<CT<PosInRead>::PSpParMat> A, AT;
         std::unique_ptr<CT<SharedSeeds>::PSpParMat> B;
         std::unique_ptr<CT<Overlap>::PSpParMat> R, S;
-        std::unique_ptr<KmerSeedBuckets> kmerbuckets;
-        std::unique_ptr<KmerList> kmerlist;
 
         std::ostringstream ss;
         ELBALogger elbalog(output_prefix, comm);
@@ -161,15 +159,18 @@ int main(int argc, char **argv)
         * 
         * yfli: may need to write more comments here
         */
+        /* start kmer counting */
         timer.start();
-        kmerbuckets = exchange_kmer(mydna, commgrid);
-        timer.stop_and_log("K-mer exchange");
+        auto data = prepare_supermer(mydna, commgrid);
+        timer.stop_and_log("prepare_supermer");
 
         timer.start();
-        kmerlist = filter_kmer(kmerbuckets, commgrid);
-        timer.stop_and_log("K-mer seeds filtering");
+        auto bucket = exchange_supermer(data, commgrid);
+        timer.stop_and_log("exchange_supermer");
 
-        kmerbuckets.reset();
+        timer.start();
+        auto kmerlist = filter_kmer(bucket, commgrid);
+        timer.stop_and_log("filter_kmer");
 
         print_kmer_histogram(*kmerlist, commgrid);
 

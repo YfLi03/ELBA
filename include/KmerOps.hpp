@@ -1,17 +1,16 @@
-#ifndef ELBA_KMEROPS_HPP
-#define ELBA_KMEROPS_HPP
+#ifndef KMEROPS_H_
+#define KMEROPS_H_
 
-#include "common.h"
+#include <mpi.h>
+#include <omp.h>
+#include <deque>
+#include <cmath>
 #include "Kmer.hpp"
 #include "MPITimer.hpp"
 #include "DnaSeq.hpp"
 #include "DnaBuffer.hpp"
 #include "Logger.hpp"
-
-#ifndef MAX_ALLTOALL_MEM
-#define MAX_ALLTOALL_MEM (128ULL * 1024ULL * 1024ULL * 1024ULL)
-#endif
-
+#include "compiletime.h"
 
 typedef uint32_t PosInRead;
 typedef  int64_t ReadId;
@@ -22,23 +21,11 @@ typedef std::array<ReadId,    UPPER_KMER_FREQ> READIDS;
 typedef std::tuple<TKmer, READIDS, POSITIONS, int> KmerListEntry;
 typedef std::vector<KmerListEntry> KmerList;
 
-#define DEFAULT_THREAD_PER_TASK 4
-#define MAX_THREAD_MEMORY_BOUNDED 8
-#define MAX_SEND_BATCH 1000000
-
-/* 
- * Some explanations about these vars and recommended settings:
- * it's suggested to set number of MPI ranks per nodes as the count of NUMA nodes
- * under such setting, the memory bandwidth is not shared between MPI ranks
- * MAX_THREAD_MEMORY_BOUNDED_EXTREME is the count of memory controller per NUMA node ( for perlmutter, it is 2 )
- * For thr other vars, i don't have a good explanation for them currently
- */
-
 
 struct KmerSeedStruct{
-    TKmer kmer;      
+    TKmer kmer;  
+    PosInRead posinread;    
     ReadId readid;
-    PosInRead posinread;
 
     KmerSeedStruct(TKmer kmer, ReadId readid, PosInRead posinread) : kmer(kmer), readid(readid), posinread(posinread) {};
     KmerSeedStruct(const KmerSeedStruct& o) : kmer(o.kmer), readid(o.readid), posinread(o.posinread) {};
@@ -79,482 +66,586 @@ struct KmerSeedStruct{
 typedef std::vector<std::vector<KmerSeedStruct>> KmerSeedBuckets;
 typedef std::vector<std::vector<std::vector<KmerSeedStruct>>> KmerSeedVecs;
 
+std::unique_ptr<KmerList>
+filter_kmer(std::unique_ptr<KmerSeedBuckets>& recv_kmerseeds, 
+     std::shared_ptr<CommGrid> comm,
+     int thr_per_task = THREAD_PER_TASK);
+
+int GetKmerOwner(const TKmer& kmer, int nprocs);
+
 
 std::unique_ptr<CT<PosInRead>::PSpParMat>
 create_kmer_matrix(const DnaBuffer& myreads, const KmerList& kmerlist, std::shared_ptr<CommGrid> commgrid);
 
-std::unique_ptr<KmerSeedBuckets> 
-exchange_kmer(const DnaBuffer& myreads,
-     std::shared_ptr<CommGrid> commgrid,
-     int thr_per_task = DEFAULT_THREAD_PER_TASK,
+
+class ParallelData{
+    private:
+
+        std::vector<std::vector<std::vector<int>>> destinations;
+        std::vector<std::vector<uint64_t>> readids;
+
+    public:
+        int nprocs;
+        int ntasks;
+        int nthr_membounded;
+        size_t readoffset;
+        std::vector<std::vector<std::vector<uint32_t>>> lengths;
+        std::vector<std::vector<std::vector<uint8_t>>> supermers;
+
+        ParallelData(int nprocs, int ntasks, int nthr_membounded, size_t readoffset = 0) {
+            this->nprocs = nprocs;
+            this->ntasks = ntasks;
+            this->nthr_membounded = nthr_membounded;
+            this->readoffset = readoffset;
+            destinations.resize(nthr_membounded);
+            lengths.resize(nthr_membounded);
+            supermers.resize(nthr_membounded);
+            readids.resize(nthr_membounded);
+
+            for (int i = 0; i < nthr_membounded; i++) {
+                lengths[i].resize(nprocs * ntasks);
+                supermers[i].resize(nprocs * ntasks);
+            }
+        }
+
+        std::vector<std::vector<int>>& get_my_destinations(int tid) {
+            return destinations[tid];
+        }
+
+        std::vector<int>& register_new_destination (int tid, uint64_t readid) {
+            destinations[tid].push_back(std::vector<int>());
+            readids[tid].push_back(readid);
+            return destinations[tid].back();
+        }
+
+        std::vector<std::vector<uint32_t>>& get_my_lengths(int tid) {
+            return lengths[tid];
+        }
+
+        std::vector<std::vector<uint8_t>>& get_my_supermers(int tid) {
+            return supermers[tid];
+        }
+
+        std::vector<uint64_t>& get_my_readids(int tid) {
+            return readids[tid];
+        }
+
+        size_t get_supermer_cnt(int procid, int taskid) {
+            size_t cnt = 0;
+            for (int i = 0; i < nthr_membounded; i++) {
+                cnt += lengths[i][procid * ntasks + taskid].size();
+            }
+            return cnt;
+        }
+};
+
+ParallelData
+prepare_supermer(const DnaBuffer& myreads,
+     std::shared_ptr<CommGrid> comm,
+     int thr_per_task = THREAD_PER_TASK,
      int max_thr_membounded = MAX_THREAD_MEMORY_BOUNDED);
 
-std::unique_ptr<KmerList>
-filter_kmer(std::unique_ptr<KmerSeedBuckets>& recv_kmerseeds, 
-     std::shared_ptr<CommGrid> commgrid, 
-     int thr_per_task = DEFAULT_THREAD_PER_TASK);
+inline int pad_bytes(const int& len) {
+    return (4 - len % 4) * 2;
+}
+
+inline int cnt_bytes(const int& len) {
+    return (len + pad_bytes(len)) / 4;
+}
+
+struct SupermerEncoder{
+    std::vector<std::vector<uint32_t>>& lengths;
+    std::vector<std::vector<uint8_t>>& supermers;
+    size_t readoffset;
+    int max_supermer_len;
+
+    SupermerEncoder(std::vector<std::vector<uint32_t>>& lengths, 
+            std::vector<std::vector<uint8_t>>& supermers, 
+            size_t readoffset,
+            int max_supermer_len) : 
+            lengths(lengths), supermers(supermers), readoffset(readoffset),
+            max_supermer_len(max_supermer_len) {};
 
 
-int GetKmerOwner(const TKmer& kmer, int nprocs);
+    // std::vector<bool> is depreciated, std::deque<bool> does not guarantee contiguity
+    // std::bitset has a fixed length, so we use std::vector<uint8_t> instead
+    // maybe we should skip this part and use a bitset for sendbuf directly
+    void copy_bits(std::vector<uint8_t>& dst, const uint8_t* src, uint64_t start_pos, int len){
 
-class BatchSender
+        size_t start = dst.size();
+        dst.resize(start + cnt_bytes(len));
+
+        for (int i = 0; i < len; i++) {
+            /* the order is confusing, just make sure we keep it consistent*/
+            int loc = i + start_pos;
+            bool first_bit = (src[loc / 4] >> (7 - 2*(loc%4))) & 1;
+            bool second_bit = (src[loc / 4] >> (6 - 2*(loc%4))) & 1;
+            dst[start + i/4] |= (first_bit << (7 - (i%4)*2)) | (second_bit << (6 - (i%4)*2));
+        }
+    }
+
+    void copy_ext(std::vector<uint8_t>& dst, PosInRead pos, ReadId readid) {
+        dst.resize(dst.size() + sizeof(PosInRead));
+        memcpy(dst.data() + dst.size() - sizeof(PosInRead), &pos, sizeof(PosInRead));
+        dst.resize(dst.size() + sizeof(ReadId));
+        memcpy(dst.data() + dst.size() - sizeof(ReadId), &readid, sizeof(ReadId));
+        return;
+    }
+
+
+    void encode(const std::vector<int>& dest, const DnaSeq& read, const ReadId readid){
+        
+        if (read.size() < KMER_SIZE) return;
+
+        /* initial conditions */
+        PosInRead start_pos = 0;
+        int cnt = 1;
+        int last_dst = dest[0];
+
+        for (int i = 1; i <= dest.size(); i++) {
+
+            if(i == dest.size() || dest[i] != last_dst || cnt == max_supermer_len - KMER_SIZE + 1) {
+                /* encode the supermer */
+                size_t len = cnt + KMER_SIZE - 1;
+                lengths[last_dst].push_back(len);
+                copy_bits(supermers[last_dst], read.data(), start_pos, len);
+                copy_ext(supermers[last_dst], start_pos, readid);
+                /* reset the counter */
+                
+                if (i < dest.size()) last_dst = dest[i];
+                cnt = 0;
+                start_pos = i;
+            }
+
+            /* increment the counter */
+            cnt++;
+        }
+    }
+};
+
+/* this is designed to be a universal all to all batch exchanger which supports group */
+class BatchExchanger
 {
+protected:
+    MPI_Comm comm;
+    MPI_Request req;
+
+    int nprocs;
+    int myrank;
+    int ntasks;                     /* number of tasks */
+    int round;
+    double t1, t2, t3, t4;
+
+    size_t batch_size;              /* maxium batch size in bytes */
+    size_t send_limit;              /* maxium size of meaningful data in bytes */
+    size_t max_element_size;        /* maxium size of a single element in bytes */
+
+    uint8_t* sendbuf_x;
+    uint8_t* recvbuf_x;
+    uint8_t* sendbuf_y;
+    uint8_t* recvbuf_y;
+
+    virtual bool write_sendbuf(uint8_t* addr, int procid) = 0;
+    virtual void parse_recvbuf(uint8_t* addr, int procid) = 0;
+
+    void write_sendbufs(uint8_t* addr) {
+        bool complete = true;
+        for (int i = 0; i < nprocs; i++) {
+            bool this_complete = write_sendbuf(addr + i * batch_size, i);
+            if (!this_complete) {
+                complete = false;
+            }
+        }
+
+        for(int i = 0; i < nprocs; i++) {
+            addr[(i+1) * batch_size - 1] = complete ? 1 : 0;
+        } 
+    }
+
+    virtual void parse_recvbufs(uint8_t* addr) {
+        for (int i = 0; i < nprocs; i++) {
+            parse_recvbuf(addr + i * batch_size, i);
+        }
+    }
+
+    bool check_complete(uint8_t* recvbuf) {
+        bool flag = true;
+        for (int i = 0; i < nprocs; i++) {
+            if (recvbuf[(i+1) * batch_size - 1] == 0) {
+                flag = false;
+                break;
+            }
+        }
+        return flag;
+    }
+
 public:
     enum Status
     {
         BATCH_NOT_INIT = 0,
         BATCH_SENDING = 1,
         BATCH_DONE = 2
-    };
+    } status;
 
-private:
-    std::shared_ptr<CommGrid> commgrid;
-    int nprocs;
-    int myrank;
 
-    Status status;
-    MPI_Request req;
-
-    size_t batch_sz;        /* batch size in bytes */
-    size_t send_limit;      /* the max number of bytes for data */
-    size_t ntasks;             /* the number of tasks */
-    size_t nthrs;             /* the number of threads */
-    size_t* loc_task;     /* the location of the currently sending task cnt for processes */
-    size_t* loc_thr;      /* the location of the currently sending thread cnt for processes */
-    size_t* loc_idx;      /* the location of the next sending item for processors */
-
-    KmerSeedVecs& kmerseeds;
-
-    /* x is always the one that is currently sending, y is the one that can be used */
-    uint8_t* sendtmp_x;
-    uint8_t* recvtmp_x;
-    uint8_t* sendtmp_y;
-    uint8_t* recvtmp_y;
-
-    /* encode and write a kmerseed to the current buffer address */
-    void encode_kmerseed_basic(uint8_t* &addr, KmerSeedStruct& kmerseed) {
-
-        TKmer kmer = kmerseed.kmer;
-        ReadId readid = kmerseed.readid;
-        PosInRead pos = kmerseed.posinread;
-
-        memcpy(addr, kmer.GetBytes(), TKmer::NBYTES);
-        memcpy(addr + TKmer::NBYTES, &readid, sizeof(ReadId));
-        memcpy(addr + TKmer::NBYTES + sizeof(ReadId), &pos, sizeof(PosInRead));
-
-        addr += (sizeof(TKmer) + sizeof(ReadId) + sizeof(PosInRead));
-    }
-
-    /* encoder vars */
-    ReadId last_readid;
-    PosInRead last_posinread;
-
-    void init_encoder() {
-        last_readid = 0;
-        last_posinread = 0;
-    }
-
-    int ca = 0, cb = 0, cc = 0, cd = 0;
-    
-    void encode_kmerseed(uint8_t* &addr, KmerSeedStruct& kmerseed) {
-
-        TKmer kmer = kmerseed.kmer;
-        ReadId readid = kmerseed.readid;
-        PosInRead pos = kmerseed.posinread;
-
-        memcpy(addr, kmer.GetBytes(), TKmer::NBYTES);
-
-        char c = 0;
-        if (readid == last_readid) {
-            if (pos > last_posinread && pos - last_posinread < (2 << 16))
-                c = 3;
-            else
-                c = 2;
-        } else if (readid == last_readid + 1) {
-            c = 1;
-        };
-
-        switch (c) {
-            case 0:
-                memcpy(addr + TKmer::NBYTES, &c, sizeof(char));
-                memcpy(addr + TKmer::NBYTES + sizeof(char), &pos, sizeof(PosInRead));
-                memcpy(addr + TKmer::NBYTES + sizeof(char) + sizeof(PosInRead), &readid, sizeof(ReadId));
-                addr += (sizeof(TKmer) + sizeof(char) + sizeof(ReadId) + sizeof(PosInRead));
-                ca++;
-                break;
-            case 1:
-                memcpy(addr + TKmer::NBYTES, &c, sizeof(char));
-                memcpy(addr + TKmer::NBYTES + sizeof(char), &pos, sizeof(PosInRead));
-                addr += (sizeof(TKmer) + sizeof(char) + sizeof(PosInRead));
-                cb++;
-                break;
-            case 2:
-                memcpy(addr + TKmer::NBYTES, &c, sizeof(char));
-                memcpy(addr + TKmer::NBYTES + sizeof(char), &pos, sizeof(PosInRead));
-                addr += (sizeof(TKmer) + sizeof(char) + sizeof(PosInRead));
-                cc++;
-                break;
-            case 3:
-                uint16_t pos16 = (uint16_t)(pos - last_posinread);
-                memcpy(addr + TKmer::NBYTES, &c, sizeof(char));
-                memcpy(addr + TKmer::NBYTES + sizeof(char), &pos16, sizeof(uint16_t));
-                addr += (sizeof(TKmer) + sizeof(char) + sizeof(uint16_t));
-                cd++;
-                break;
+    void initialize() {
+        if (status != BATCH_NOT_INIT) {
+            return;
         }
 
-        last_readid = readid;
-        last_posinread = pos;
-
-    }
-
-    /* 
-     * Write sendbuf for a process. returns if it has completed 
-     * This function is also responsible for determining the vector to read from
-     * Returns if all data has been sent (for this process)
-     */
-    bool write_sendbuf(uint8_t* addr, int procid) {
-
-        init_encoder();
-        size_t task = loc_task[procid];
-        size_t thr = loc_thr[procid];
-        size_t idx = loc_idx[procid];
-
-        std::vector<KmerSeedStruct> &v = kmerseeds[thr][procid * ntasks + task];
-        size_t max_idx = v.size();
-
-        uint8_t* addr_limit = addr + send_limit;
-
-        while (addr <= addr_limit && task < ntasks) {
-            encode_kmerseed(addr, v[idx]);
-            idx++;
-
-            if (idx >= max_idx) {
-                idx = 0;
-                thr++;
-                if (thr >= nthrs) {
-                    thr = 0;
-                    task++;
-                }
-                if (task >= ntasks) break;
-
-                v = kmerseeds[thr][procid * ntasks + task];
-                max_idx = v.size();
-            }
-        }
-
-        loc_idx[procid] = idx;
-        loc_thr[procid] = thr;
-        loc_task[procid] = task;
-
-        return (task >= ntasks);
-    }
-
-    /* write the whole sendbuf for one pass. returns if all data has been sent */
-    void write_sendbufs(uint8_t* addr) {
-
-        bool finished = true;
-
-        // #pragma omp parallel for num_threads(4)
-        for(int i = 0; i < nprocs; i++) {
-            bool myfinished = write_sendbuf(addr + batch_sz * i, i);
-            
-            // #pragma omp critical
-            {
-                if (!myfinished) finished = false;
-            }
-        }
-
-        /* write the last byte of each buf which indicates finished or not */
-        if (finished) {
-            for (int i = 0; i < nprocs; i++)
-                addr[batch_sz * i + batch_sz - 1] = 1;
-        } else {
-            for (int i = 0; i < nprocs; i++)
-                addr[batch_sz * i + batch_sz - 1] = 0;
-        }
-
-    }
-
-
-public:
-
-    void print_results(Logger &l) {
-        l()<<ca<<" "<<cb<<" "<<cc<<" "<<cd<<std::endl;
-        l.Flush("compress results");
-    }
-    BatchSender(std::shared_ptr<CommGrid> commgrid, size_t ntasks, size_t nthrs, size_t batch_size, KmerSeedVecs& kmerseeds) : 
-        commgrid(commgrid), batch_sz(batch_size), kmerseeds(kmerseeds), status(BATCH_NOT_INIT), ntasks(ntasks), nthrs(nthrs)
-    {
-        /*
-         * Suppose buffer has a max size of n
-         * n - size(kmer) - size(readid) - size(posinread) - sizeof(char) = max start location
-         * which means that when the pointer is leq this value, we must continue to store items
-         * if the pointer is greater than the value, we cannot store items anymore
-         * the last byte is reserved for the flag, indicating if a process has sent all its data .
-         * 
-         * We also need to take care: what if I have sent all my data but some other processes haven't?
-         * Well, we just sent random bits to the process. The Important thing is that the last flag is always set.
-         * The dst process know how many kmers we're sending, so it will limit the number of kmers it reads.
-         */
-
-        send_limit = batch_sz - sizeof(char) - TKmer::NBYTES - sizeof(ReadId) - sizeof(PosInRead) - sizeof(char);
-
-        nprocs = commgrid->GetSize();
-        myrank = commgrid->GetRank();
-
-        sendtmp_x = new uint8_t[batch_sz * nprocs];
-        recvtmp_x = new uint8_t[batch_sz * nprocs];
-
-        sendtmp_y = new uint8_t[batch_sz * nprocs];
-        recvtmp_y = new uint8_t[batch_sz * nprocs];
-
-        loc_task = new size_t[nprocs];
-        loc_thr = new size_t[nprocs];
-        loc_idx = new size_t[nprocs];
-        memset(loc_task, 0, sizeof(size_t) * nprocs);
-        memset(loc_thr, 0, sizeof(size_t) * nprocs);
-        memset(loc_idx, 0, sizeof(size_t) * nprocs);
-    };
-
-    ~BatchSender()  
-    {
-        if (sendtmp_x != nullptr) delete[] sendtmp_x;
-        if (recvtmp_y != nullptr) delete[] recvtmp_x;
-        if (sendtmp_y != nullptr) delete[] sendtmp_y;
-        if (recvtmp_y != nullptr) delete[] recvtmp_y;
-        if (loc_task != nullptr) delete[] loc_task;
-        if (loc_thr != nullptr) delete[] loc_thr;
-        if (loc_idx != nullptr) delete[] loc_idx;
-
-    }
-
-    Status get_status() { return status; }
-
-    void init()
-    {
+        sendbuf_x = new uint8_t[batch_size * nprocs];
+        recvbuf_x = new uint8_t[batch_size * nprocs];
+        sendbuf_y = new uint8_t[batch_size * nprocs];
+        recvbuf_y = new uint8_t[batch_size * nprocs];
 
         status = BATCH_SENDING;
-        write_sendbufs(sendtmp_x);
-        MPI_Ialltoall(sendtmp_x, batch_sz, MPI_BYTE, recvtmp_x, batch_sz, MPI_BYTE, commgrid->GetWorld(), &req);
-
+        write_sendbufs(sendbuf_y);
+        MPI_Ialltoall(sendbuf_y, batch_size, MPI_BYTE, recvbuf_y, batch_size, MPI_BYTE, comm, &req);
     }
 
-    uint8_t* progress() {
-        if (status != BATCH_SENDING) return 0;
 
-        #if LOG_LEVEL >= 3
-        MPITimer timer(commgrid->GetWorld());
-        timer.start();
-        #endif
+    void progress() {
+        if (status != BATCH_SENDING) {
+            return;
+        }
+        round++;
 
-        write_sendbufs(sendtmp_y);
+        /* x is the buffer we can use to write and parse */
 
-        #if LOG_LEVEL >= 3
-        timer.stop_and_log("write_sendbufs");
-        timer.start();
-        #endif
+        write_sendbufs(sendbuf_x);
 
         MPI_Wait(&req, MPI_STATUS_IGNORE);
 
-        #if LOG_LEVEL >= 3
-        timer.stop_and_log("MPI_Wait");
-        #endif
 
-        std::swap(sendtmp_x, sendtmp_y);
-        std::swap(recvtmp_x, recvtmp_y); 
+        std::swap(sendbuf_x, sendbuf_y);
+        std::swap(recvbuf_x, recvbuf_y);
 
-        // see if completed
-        bool finished = true;
-        for (int i = 0; i < nprocs; i++)
-            if (recvtmp_y[batch_sz * i + batch_sz - 1] == false) {
-                finished = false;
-                break;
-            }
-
-        if (finished) {
+        if (check_complete(recvbuf_x)) {
             status = BATCH_DONE;
-            return recvtmp_y;
+            parse_recvbufs(recvbuf_x);
+            return;
         }
 
+        MPI_Ialltoall(sendbuf_y, batch_size, MPI_BYTE, recvbuf_y, batch_size, MPI_BYTE, comm, &req);
 
-        MPI_Ialltoall(sendtmp_x, batch_sz, MPI_BYTE, recvtmp_x, batch_sz, MPI_BYTE, commgrid->GetWorld(), &req);
-        return recvtmp_y;
+        parse_recvbufs(recvbuf_x);
+
+    }
+
+    virtual void print_stats(){
+    }
+
+    BatchExchanger(MPI_Comm comm, size_t ntasks, size_t batch_size, size_t max_element_size) : 
+        comm(comm), batch_size(batch_size), status(BATCH_NOT_INIT), ntasks(ntasks), max_element_size(max_element_size)
+    {
+        round = 0;
+        MPI_Comm_size(comm, &nprocs);
+        MPI_Comm_rank(comm, &myrank);
+        send_limit = batch_size - sizeof(char) - max_element_size;
+
+    };
+
+    ~BatchExchanger()  
+    {
+        delete[] sendbuf_x;
+        delete[] recvbuf_x;
+        delete[] sendbuf_y;
+        delete[] recvbuf_y;
     }
 };
 
-
-class BatchStorer
+class LengthExchanger : public BatchExchanger
 {
-    KmerSeedBuckets& kmerseeds;
-    int taskcnt, nprocs;
-    size_t batch_size;
-    size_t send_limit;
-    size_t* expected_recvcnt;
-    size_t* recvcnt;
-    int* recv_task_id;
+private:
+    int nthr_membounded;
+    std::vector<std::vector<std::vector<uint32_t>>>& lengths;
+    
+    std::vector<size_t> current_taskid;
+    std::vector<size_t> current_tid;
+    std::vector<size_t> current_idx;
 
-    /* it should be inlined by default */
-    inline void decode_basic(uint8_t* &addr, std::vector<KmerSeedStruct> &kmerseeds) {
-        TKmer kmer((void*)addr);                
-        ReadId readid = *((ReadId*)(addr + TKmer::NBYTES));
-        PosInRead pos = *((PosInRead*)(addr + TKmer::NBYTES + sizeof(ReadId)));
-        kmerseeds.emplace_back(kmer, readid, pos);
-        addr += TKmer::NBYTES + sizeof(ReadId) + sizeof(PosInRead);
-    }
+    bool write_sendbuf(uint8_t* addr, int procid) override {
+        size_t taskid = current_taskid[procid];
+        size_t tid = current_tid[procid];
+        size_t idx = current_idx[procid];
 
-    /* decoder vars */
-    ReadId last_readid;
-    PosInRead last_posinread;
+        size_t cnt = 0;
+        while (cnt <= send_limit && taskid < (procid + 1) * ntasks ) {
+            size_t n = lengths[tid][taskid].size();
+            // need to check if this +1 is good
+            size_t n_to_send = std::min(n - idx, (send_limit - cnt) / sizeof(uint32_t) + 1);
+            memcpy(addr + cnt, lengths[tid][taskid].data() + idx, n_to_send * sizeof(uint32_t));
+            cnt += n_to_send * sizeof(uint32_t);
+            idx += n_to_send;
 
-    void init_decoder() {
-        last_readid = 0;
-        last_posinread = 0;
-    }
-
-    inline void decode(uint8_t* &addr, std::vector<KmerSeedStruct> &kmerseeds) {
-        TKmer kmer((void*)addr);
-        
-        char c = *((char*)(addr + TKmer::NBYTES));
-        addr = addr + TKmer::NBYTES + sizeof(char);
-
-        ReadId readid = 0;
-        PosInRead pos = 0;
-
-        switch (c) {
-            case 0:
-                pos = (*((PosInRead*)(addr)));
-                readid = *((ReadId*)(addr + sizeof(PosInRead)));
-                addr += (sizeof(ReadId) + sizeof(PosInRead));
-                break;
-            case 1:
-                pos = (*((PosInRead*)(addr)));
-                readid = last_readid + 1;
-                addr += (sizeof(PosInRead));
-                break;
-            case 2:
-                pos = (*((PosInRead*)(addr)));
-                readid = last_readid;
-                addr += (sizeof(PosInRead));
-                break;
-            case 3:
-                uint16_t pos16 = *((uint16_t*)(addr));
-                pos = last_posinread + pos16;
-                readid = last_readid;
-                addr += (sizeof(uint16_t));
-                break;
+            if (idx == n) {
+                tid++;
+                idx = 0;
+                if(tid == nthr_membounded) {
+                    taskid++;
+                    tid = 0;
+                }
+            }
         }
 
-        kmerseeds.emplace_back(kmer, readid, pos);
+        current_taskid[procid] = taskid;
+        current_tid[procid] = tid;
+        current_idx[procid] = idx;
 
-        last_readid = readid;
-        last_posinread = pos;
+        return taskid == (procid + 1) * ntasks;
+    }
+
+    std::vector<size_t>& recv_cnt;
+    std::vector<std::vector<uint32_t>>& recvbuf;
+    std::vector<size_t> recv_idx;
+    std::vector<size_t> recv_taskid;
+    // Note that here the task id is the "local" task id, which starts from 0 for each process
+
+    void parse_recvbuf(uint8_t* addr, int procid) override {
+        size_t taskid = recv_taskid[procid];
+        size_t idx = recv_idx[procid];
+
+        if (taskid == ntasks) {
+            return;
+        }
+
+        size_t cnt = 0;
+        while (cnt <= send_limit && taskid < ntasks) {
+            size_t n_to_recv = std::min(recv_cnt[taskid + procid * ntasks] - idx, (send_limit - cnt) / sizeof(uint32_t) + 1);
+            memcpy(recvbuf[taskid + procid * ntasks].data() + idx, addr + cnt, n_to_recv * sizeof(uint32_t));
+            cnt += n_to_recv * sizeof(uint32_t);
+            idx += n_to_recv;
+            if (idx == recv_cnt[taskid + procid * ntasks]) {
+                taskid++;
+                idx = 0;
+            }
+        }
+
+        recv_taskid[procid] = taskid;
+        recv_idx[procid] = idx;
+
     }
 
 public:
-    BatchStorer(KmerSeedBuckets& kmerseeds,  int taskcnt, int nprocs, size_t* expected_recvcnt, size_t batch_size) : 
-        kmerseeds(kmerseeds), taskcnt(taskcnt), nprocs(nprocs), expected_recvcnt(expected_recvcnt), batch_size(batch_size)
-        {
-            send_limit = batch_size - sizeof(char) - TKmer::NBYTES - sizeof(ReadId) - sizeof(PosInRead) - sizeof(char);
-            recvcnt = new size_t[nprocs];
-            recv_task_id = new int[nprocs];
-            memset(recvcnt, 0, sizeof(size_t) * nprocs);
-            memset(recv_task_id, 0, sizeof(int) * nprocs);
+    LengthExchanger(MPI_Comm comm, 
+                size_t ntasks, 
+                size_t batch_size, 
+                size_t max_element_size, 
+                int nthr_membounded, 
+                std::vector<std::vector<std::vector<uint32_t>>>& lengths,
+                std::vector<size_t>& recv_cnt,
+                std::vector<std::vector<uint32_t>>& recvbuf) : 
+        BatchExchanger(comm, ntasks, batch_size, max_element_size), 
+        nthr_membounded(nthr_membounded), lengths(lengths), recv_cnt(recv_cnt), recvbuf(recvbuf) {
+            current_taskid.resize(nprocs);
+            for (int i = 0; i < nprocs; i++) {
+                current_taskid[i] = ntasks * i;
+            }
+            current_tid.resize(nprocs, 0);
+            current_idx.resize(nprocs, 0);
+
+            recv_idx.resize(nprocs, 0);
+            recv_taskid.resize(nprocs, 0);
+            recvbuf.resize(nprocs * ntasks);
+            for (int i = 0; i < nprocs * ntasks; i++) {
+                recvbuf[i].resize(recv_cnt[i], 0);
+            }
+        }
+};
+
+
+
+struct BucketAssistant{
+    int ntasks, nprocs;
+    KmerSeedBuckets& bucket;
+    std::vector<std::vector<size_t>> recv_base;
+    std::vector<std::vector<size_t>> current_recv;
+
+
+    BucketAssistant(int ntasks, int nprocs, KmerSeedBuckets& bucket, std::vector<std::vector<uint32_t>>& lengths) : 
+        ntasks(ntasks), nprocs(nprocs), bucket(bucket){
+        std::vector<std::vector<size_t>> recv_cnt;
+
+        recv_cnt.resize(nprocs);
+        recv_base.resize(nprocs);
+        current_recv.resize(nprocs);
+
+        // Turn the lengths into the actual counts
+        for(int i = 0; i < nprocs; i++) {
+            recv_cnt[i].resize(ntasks, 0);
+            for(int j = 0; j < ntasks; j++) {
+                recv_cnt[i][j] = std::accumulate(lengths[i * ntasks + j].begin(), lengths[i * ntasks + j].end(), 0) - ( KMER_SIZE - 1 ) * lengths[i * ntasks + j].size();
+            }
         }
 
-    ~BatchStorer()
-    {
-        
-        delete[] recvcnt;
-        delete[] recv_task_id;
-        
+        recv_base[0].resize(ntasks, 0);
+        for(int i = 1; i < nprocs; i++) {
+            recv_base[i].resize(ntasks, 0);
+            for(int j = 0; j < ntasks; j++) {
+                recv_base[i][j] = recv_base[i-1][j] + recv_cnt[i-1][j];
+            }
+        }
+
+        for(int i = 0; i < nprocs; i++) {
+            current_recv[i].resize(ntasks, 0);
+        }
+
+        for(int i = 0; i < ntasks; i++) {
+            bucket[i].resize(recv_base[nprocs-1][i] + recv_cnt[nprocs-1][i]);
+        }
+    }    
+    
+    inline void insert(const int& procid, const int& taskid, const DnaSeq& seq, const PosInRead& pos, const ReadId& readid) {
+        size_t len = seq.size() - KMER_SIZE + 1;
+
+        auto repmers = TKmer::GetRepKmers(seq);
+        size_t base = recv_base[procid][taskid] + current_recv[procid][taskid];
+
+        for (int i = 0; i < len; i++) {
+            bucket[taskid][base + i] = KmerSeedStruct(repmers[i], readid, pos + i);
+        }
+
+        current_recv[procid][taskid] += len;
     }
+};
 
-    void store(uint8_t* recvbuf)
-    {
-        #if LOG_LEVEL >= 3
-        MPITimer timer(MPI_COMM_WORLD);
-        timer.start();
-        #endif
+class SupermerExchanger : public BatchExchanger
+{
+private:
+    int nthr_membounded;
+    std::vector<std::vector<std::vector<uint32_t>>>& lengths;
+    std::vector<std::vector<std::vector<uint8_t>>>& supermers;
+    std::vector<size_t> current_taskid;
+    std::vector<size_t> current_tid;
+    std::vector<size_t> current_idx;
+    std::vector<size_t> current_supermer_idx;
 
-        for(int i = 0; i < nprocs; i++) 
-        {
-            init_decoder();
-            if (recv_task_id[i] >= taskcnt) continue;      // all data for this task has been received. all the rest is padding
-            int working_task = recv_task_id[i];
-            size_t cnt = recvcnt[i];
-            size_t max_cnt = expected_recvcnt[ taskcnt * i + working_task ];
-            uint8_t* addrs2read = recvbuf + batch_size * i;
-            uint8_t* addr_limit = addrs2read + send_limit;
+    std::vector<size_t> _bytes_sent;
 
-            while(addrs2read <= addr_limit && working_task < taskcnt) {
-                decode(addrs2read, kmerseeds[working_task]);
-                cnt++;
+    bool write_sendbuf(uint8_t* addr, int procid) override {
+        size_t taskid = current_taskid[procid];
+        size_t tid = current_tid[procid];
+        size_t idx = current_idx[procid];
+        size_t supermer_idx = current_supermer_idx[procid];
 
-                if (cnt >= max_cnt) {
-                    recv_task_id[i]++;
-                    if (recv_task_id[i] >= taskcnt) break;
-                    working_task++;
-                    cnt = 0;
-                    max_cnt = expected_recvcnt[ taskcnt * i + working_task ];
+        size_t cnt = 0;
+        while (cnt <= send_limit && taskid < (procid + 1) * ntasks ) {
+
+            if(idx >= lengths[tid][taskid].size()) {
+                tid++;
+                idx = 0;
+                supermer_idx = 0;
+                if(tid == nthr_membounded) {
+                    taskid++;
+                    tid = 0;
                 }
+                continue;
             }
 
-            recvcnt[i] = cnt;
+            size_t len_bytes = cnt_bytes(lengths[tid][taskid][idx]) + sizeof(PosInRead) + sizeof(ReadId);
+            memcpy(addr + cnt, supermers[tid][taskid].data() + supermer_idx, len_bytes);
+            cnt += len_bytes;
+            supermer_idx += len_bytes;
+            idx++;
+
         }
 
-        #if LOG_LEVEL >= 3
-        timer.stop_and_log("store");
-        #endif
+        current_taskid[procid] = taskid;
+        current_tid[procid] = tid;
+        current_idx[procid] = idx;
+        current_supermer_idx[procid] = supermer_idx;
+
+        return taskid == (procid + 1) * ntasks;
     }
-};
 
-struct KmerParserHandler
-{
-    int nprocs;
-    ReadId readoffset;
-    std::vector<std::vector<KmerSeedStruct>>& kmerseeds;
+    std::vector<std::vector<uint32_t>>& recv_length;
+    std::vector<size_t> recv_idx;
+    std::vector<size_t> recv_taskid;
+    std::vector<size_t> recv_cnt;
+    BucketAssistant assistant;
 
-    KmerParserHandler(std::vector<std::vector<KmerSeedStruct>>& kmerseeds, ReadId readoffset) : nprocs(kmerseeds.size()), readoffset(readoffset), kmerseeds(kmerseeds) {}
-
-    void operator()(const TKmer& kmer, size_t kid, size_t rid)
-    {
-        kmerseeds[GetKmerOwner(kmer, nprocs)].emplace_back(kmer, static_cast<ReadId>(rid) + readoffset, static_cast<PosInRead>(kid));
-    }
-};
-
-template <typename KmerHandler>
-void ForeachKmer(const DnaBuffer& myreads, KmerHandler& handler)
-{
-    size_t i;
-
-    /*
-     * Go through each local read.
-     */
-    for (i = 0; i < myreads.size(); ++i)
-    {
-        /*
-         * If it is too small then continue to the next one.
-         */
-        if (myreads[i].size() < KMER_SIZE)
-            continue;
-
-        /*
-         * Get all the representative k-mer seeds.
-         */
-        std::vector<TKmer> repmers = TKmer::GetRepKmers(myreads[i]);
-
-        size_t j = 0;
-
-        /*
-         * Go through each k-mer seed.
-         */
-        for (auto meritr = repmers.begin(); meritr != repmers.end(); ++meritr, ++j)
-        {
-            handler(*meritr, j, i);
+    void parse_recvbufs(uint8_t* addr) {
+        #pragma omp parallel for num_threads(MAX_THREAD_MEMORY_BOUNDED)
+        for (int i = 0; i < nprocs; i++) {
+            parse_recvbuf(addr + i * batch_size, i);
         }
     }
-}
+
+
+    void parse_recvbuf(uint8_t* addr, int procid) override {
+        size_t taskid = recv_taskid[procid];
+        size_t idx = recv_idx[procid];
+
+        if (taskid == ntasks) {
+            return;
+        }
+
+        size_t cnt = 0;
+        while (cnt <= send_limit && taskid < ntasks) {
+            if (idx >= recv_cnt[procid * ntasks + taskid]) {
+                taskid++;
+                idx = 0;
+                continue;
+            }
+            size_t len = recv_length[procid * ntasks + taskid][idx];
+            size_t len_bytes = cnt_bytes(len) + sizeof(PosInRead) + sizeof(ReadId);
+
+            auto seq = DnaSeq(len, addr+cnt);
+            PosInRead pos = *reinterpret_cast<PosInRead*>(addr + cnt + cnt_bytes(len));
+            ReadId readid = *reinterpret_cast<ReadId*>(addr + cnt + cnt_bytes(len) + sizeof(PosInRead));
+            assistant.insert(procid, taskid, seq, pos, readid);
+
+            // memcpy(bucket[procid * ntasks + taskid].data() + idx, addr + cnt, len_bytes);
+            cnt += len_bytes;
+            idx++;
+        }
+
+        recv_taskid[procid] = taskid;
+        recv_idx[procid] = idx;
+
+        _bytes_sent[procid] += cnt;
+
+    }
+
+
+public:
+    SupermerExchanger(MPI_Comm comm, 
+                size_t ntasks, 
+                size_t batch_size, 
+                size_t max_element_size, 
+                int nthr_membounded, 
+                std::vector<std::vector<std::vector<uint32_t>>>& lengths,
+                std::vector<std::vector<std::vector<uint8_t>>>& supermers,
+                std::vector<size_t>& recv_cnt,
+                std::vector<std::vector<uint32_t>>& recv_length,
+                KmerSeedBuckets& bucket) : 
+        BatchExchanger(comm, ntasks, batch_size, max_element_size), 
+        nthr_membounded(nthr_membounded), lengths(lengths), supermers(supermers), recv_cnt(recv_cnt), recv_length(recv_length), 
+        assistant(ntasks, nprocs, bucket, recv_length) {
+            current_taskid.resize(nprocs);
+            for (int i = 0; i < nprocs; i++) {
+                current_taskid[i] = ntasks * i;
+            }
+            current_tid.resize(nprocs, 0);
+            current_idx.resize(nprocs, 0);
+            current_supermer_idx.resize(nprocs, 0);
+
+            recv_idx.resize(nprocs, 0);
+            recv_taskid.resize(nprocs, 0);
+            
+            _bytes_sent.resize(nprocs, 0);
+
+        }
+
+    void print_stats() override {
+     
+    }
+
+};
+
+std::unique_ptr<KmerSeedBuckets> exchange_supermer(ParallelData& data, std::shared_ptr<CommGrid> comm);
+
+
 
 template <typename KmerHandler>
 void ForeachKmerParallel(const DnaBuffer& myreads, std::vector<KmerHandler>& handlers, int nthreads)
@@ -563,8 +654,6 @@ void ForeachKmerParallel(const DnaBuffer& myreads, std::vector<KmerHandler>& han
     /*
      * Go through each local read.
      */
-
-    // yfli: TODO: test the performance of different number of threads. This might be a memory bandwidth issue.
 
     /* cosidering the NUMA effect, we may want the vecs to be NUMA-local*/
     #pragma omp parallel for num_threads(nthreads) 
@@ -594,4 +683,31 @@ void ForeachKmerParallel(const DnaBuffer& myreads, std::vector<KmerHandler>& han
     }
 }
 
-#endif // ELBA_KMEROPS_HPP
+struct Minimizer_Deque {
+
+    /* The first item is the hash value, the second one is the position of the minimizer */
+    std::deque<std::pair<uint64_t, int>> deq;
+
+    void remove_minimizer(int pos) {
+        while (!deq.empty() && deq.front().second <= pos) {
+            deq.pop_front();
+        }
+    }
+
+    void insert_minimizer(uint64_t hash, int pos) {
+        while (!deq.empty() && deq.back().first < hash) {
+            deq.pop_back();
+        }
+        deq.push_back(std::make_pair(hash, pos));
+    }
+
+    uint64_t get_current_minimizer() {
+        return deq.front().first;
+    }
+};
+
+int GetMinimizerOwner(const uint64_t& hash, int tot_tasks);
+
+void FindKmerDestinationsParallel(const DnaBuffer& myreads, int nthreads, int tot_tasks, ParallelData& data);
+
+#endif // KMEROPS_H_
