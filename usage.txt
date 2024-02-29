@@ -5,10 +5,6 @@ To use ELBA on perlmutter, follow these steps:
         $> git clone https://github.com/PASSIONLab/ELBA . && cd ELBA
         $> git clone https://github.com/PASSIONLab/CombBLAS
 
-    * Load compiler:
-
-        $> module load PrgEnv-gnu
-
     * In order to compile ELBA, you have to provide the k-mer size, lower, and upper frequency
       bounds as inputs. For example, if the k-mer size was 31, the lower frequency bound 15,
       and upper frequency bound 35, you would do the following:
@@ -19,12 +15,12 @@ To use ELBA on perlmutter, follow these steps:
 
     * To run ELBA on a FASTA dataset named "reads.fa", first index the file with
       the command:
+        $> cd YOUR_DATASET_DIR
         $> module load spack
         $> spack load samtools
         $> samtools faidx reads.fa
 
-      ELBA will crash if the input FASTA is not indexed. You may need to run the following
-      command prior to loading spack:
+      You may need to run the following command prior to loading spack:
         $> module load cpu
 
       which will disable the gpu module. However, remember to reload the gpu module before
@@ -46,6 +42,18 @@ To use ELBA on perlmutter, follow these steps:
 
        etc.
 
+    * Using salloc instead may be helpful when you're debugging. It help you avoid waiting
+      for the queue.
+
+        # 2 Nodes, cpu node
+        $> salloc -C cpu -q interactive --nodes 2 --time 01:00:00
+
+       etc.
+
+      Then use the srun command as usual. You'll get ELBA running immediately.
+      Remeber to tee the output to a file if you want to save the output log.
+
+
     * ELBA can also take further input parameters as follows:
 
         Usage: elba [options] <reads.fa>
@@ -55,3 +63,6 @@ To use ELBA on perlmutter, follow these steps:
                  -G INT   gap penalty [1]
                  -o STR   output file name prefix "elba"
                  -h       help message
+
+      An example of further parameters may be -A 1 -B 1 -x 30 -c 0.65
+
