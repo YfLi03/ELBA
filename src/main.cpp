@@ -35,6 +35,8 @@ derivative works, and perform publicly and display publicly, and to permit other
 #include "PruneChimeras.hpp"
 #include "MPITimer.hpp"
 #include "ELBALogger.hpp"
+#include "hysortk.hpp"
+
 
 int returncode;
 std::string fasta_fname;
@@ -100,7 +102,6 @@ int main(int argc, char **argv)
         std::unique_ptr<CT<PosInRead>::PSpParMat> A, AT;
         std::unique_ptr<CT<SharedSeeds>::PSpParMat> B;
         std::unique_ptr<CT<Overlap>::PSpParMat> R, S;
-        std::unique_ptr<KmerCountMap> kmermap;
 
         std::ostringstream ss;
         ELBALogger elbalog(output_prefix, comm);
@@ -189,43 +190,11 @@ int main(int argc, char **argv)
          *
          */
         timer.start();
-        kmermap = get_kmer_count_map_keys(mydna, commgrid);
-        timer.stop_and_log("collecting distinct k-mers");
+        auto mydna_ = reinterpret_cast<hysortk::DnaBuffer*>(&mydna);
+        auto kmerlist = hysortk::kmer_count(*mydna_, comm);
+        timer.stop_and_log("hysortk k-mer counting");
 
-        /*
-         * Now that every process has its local partition of the distributed k-mer hash table
-         * initialized with all the keys (k-mers) it needs, we do a second pass over every k-mer
-         * and send them to their destinations, this time including information about which read ID
-         * the k-mer was parsed from, and the position of the k-mer within that read. Using the
-         * Bloom filter, we can quickly query received k-mers and discard those k-mers which we know
-         * aren't keys in the local @kmermap.
-         *
-         * For each received k-mer that passes through the Bloom filter (is accepted), its
-         * corresponding triple (READIDS, POSITIONS, count) is updated. This way, the local
-         * process is able to quickly find all the reads (via their global IDs) that contain a particular
-         * k-mer, and quickly find the position within that read where the k-mer is located. The
-         * count parameter merely states how many times that k-mer has been found in the dataset,
-         * and is therefore equivalent to the number of used entries of READIDS and POSITIONS.
-         *
-         * Suppose that a k-mer @s appears more that UPPER_KMER_FREQ times in the input. Then
-         * it is guaranteed that, eventually, the processor responsible for storing @s will
-         * receive an instance of @s (plus a global read id and position where @s came from) that
-         * will put it over the capacity of POSITIONS and READIDS. We therefore always check
-         * if a received k-mer will push us over this threshold, and if it does, we DELETE the
-         * k-mer key of @s on the owner processor. That way, any other instances of @s from
-         * other reads are discarded because we only record entries for k-mers that exist in
-         * the hash table.
-         *
-         * Finally, once the collective exchange is finished, we delete all k-mer keys of
-         * k-mers that appeared less than LOWER_KMER_FREQ times. The result is a distributed
-         * hash table mapping reliable k-mers (k-mers that appear within the defined frequency bounds)
-         * to their corresponding k-mer count entries.
-         */
-        timer.start();
-        get_kmer_count_map_values(mydna, *kmermap, commgrid);
-        timer.stop_and_log("counting recording k-mer seeds");
-
-        print_kmer_histogram(*kmermap, commgrid);
+        hysortk::print_kmer_histogram(*kmerlist, comm);
 
         /*
          * Now that all the reliable k-mers and their locations have been computed and stored
@@ -256,14 +225,14 @@ int main(int argc, char **argv)
          * is clear by now what @A is.
          */
         timer.start();
-        A = create_kmer_matrix(mydna, *kmermap, commgrid);
+        A = create_kmer_matrix(mydna, *kmerlist, commgrid);
         timer.stop_and_log("creating k-mer matrix");
 
         /*
          * Once @A has been constructed, we have no more use for the distributed k-mer hash table
          * so we release all its memory.
          */
-        kmermap.reset();
+        kmerlist.reset();
 
         /*
          * The SpGEMM overlap detection phase requires both @A and its transpose @AT.

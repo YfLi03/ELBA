@@ -357,14 +357,28 @@ int GetKmerOwner(const TKmer& kmer, int nprocs)
     assert(owner >= 0 && owner < static_cast<int>(nprocs));
     return static_cast<int>(owner);
 }
+/*
+void write_to_file(std::string output_dir, int myrank, const hysortk::KmerListS& kmerlist) {
+    std::string filename = output_dir + "/kmerlist_" + std::to_string(myrank) + ".txt";
+    std::ofstream out(filename);
+    for (auto& itr : kmerlist) {
+        out << itr.kmer << " " << itr.cnt << " ";
+        for (int i = 0; i < itr.cnt; ++i) {
+            out << itr.rid[i] << " " << itr.pos[i] << " ";
+        }
+        out << std::endl;
+    }
+    out.close();
+}
+*/
 
 std::unique_ptr<CT<PosInRead>::PSpParMat>
-create_kmer_matrix(const DnaBuffer& myreads, const KmerCountMap& kmermap, std::shared_ptr<CommGrid> commgrid)
+create_kmer_matrix(const DnaBuffer& myreads, const hysortk::KmerListS& kmerlist, std::shared_ptr<CommGrid> commgrid)
 {
     int myrank = commgrid->GetRank();
     int nprocs = commgrid->GetSize();
 
-    int64_t kmerid = kmermap.size();
+    int64_t kmerid = kmerlist.size();
     int64_t totkmers = kmerid;
     int64_t totreads = myreads.size();
 
@@ -377,11 +391,11 @@ create_kmer_matrix(const DnaBuffer& myreads, const KmerCountMap& kmermap, std::s
     std::vector<int64_t> local_rowids, local_colids;
     std::vector<PosInRead> local_positions;
 
-    for (auto itr = kmermap.cbegin(); itr != kmermap.cend(); ++itr)
+    for (auto& itr : kmerlist)
     {
-        const READIDS& readids = std::get<0>(itr->second);
-        const POSITIONS& positions = std::get<1>(itr->second);
-        int cnt = std::get<2>(itr->second);
+        auto& readids = itr.rid;
+        auto& positions = itr.pos;
+        int cnt = itr.cnt;
 
         for (int j = 0; j < cnt; ++j)
         {

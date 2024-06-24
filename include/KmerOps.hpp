@@ -6,13 +6,15 @@
 #include "DnaSeq.hpp"
 #include "DnaBuffer.hpp"
 #include "HyperLogLog.hpp"
+#include "hysortk.hpp"
+
 
 #ifndef MAX_ALLTOALL_MEM
 #define MAX_ALLTOALL_MEM (128ULL * 1024ULL * 1024ULL * 1024ULL)
 #endif
 
 typedef uint32_t PosInRead;
-typedef  int64_t ReadId;
+typedef  int32_t ReadId;
 
 typedef std::array<PosInRead, UPPER_KMER_FREQ> POSITIONS;
 typedef std::array<ReadId,    UPPER_KMER_FREQ> READIDS;
@@ -22,7 +24,7 @@ typedef std::tuple<READIDS, POSITIONS, int> KmerCountEntry;
 typedef std::unordered_map<TKmer, KmerCountEntry> KmerCountMap;
 
 std::unique_ptr<CT<PosInRead>::PSpParMat>
-create_kmer_matrix(const DnaBuffer& myreads, const KmerCountMap& kmermap, std::shared_ptr<CommGrid> commgrid);
+create_kmer_matrix(const DnaBuffer& myreads, const hysortk::KmerListS& kmerlist, std::shared_ptr<CommGrid> commgrid);
 
 std::unique_ptr<KmerCountMap>
 get_kmer_count_map_keys(const DnaBuffer& myreads, std::shared_ptr<CommGrid> commgrid);

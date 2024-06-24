@@ -3,7 +3,7 @@ L?=15
 U?=35
 LOG?=2
 D?=0
-COMPILE_TIME_PARAMETERS=-DKMER_SIZE=$(K) -DLOWER_KMER_FREQ=$(L) -DUPPER_KMER_FREQ=$(U) -DLOG_LEVEL=$(LOG)
+COMPILE_TIME_PARAMETERS=-DKMER_SIZE=$(K) -DLOWER_KMER_FREQ=$(L) -DUPPER_KMER_FREQ=$(U) -DLOG_LEVEL=$(LOG) -DEXTENSION=1
 OPT=
 
 ifeq ($(D), 1)
@@ -21,7 +21,11 @@ FLAGS=$(OPT) $(COMPILE_TIME_PARAMETERS) -DTHREADED -fopenmp -Wno-maybe-uninitial
 COMBBLAS=./CombBLAS
 COMBBLAS_INC=$(COMBBLAS)/include/CombBLAS
 COMBBLAS_SRC=$(COMBBLAS)/src
-INCADD=-I$(COMBBLAS)/include/ -I$(COMBBLAS)/psort-1.0/include/ -I$(COMBBLAS)/usort/include/ -I$(COMBBLAS)/graph500-1.2/generator/include/
+
+HYSORTK=./HySortK
+HYSORTK_INC=$(HYSORTK)/include
+INCADD=-I$(COMBBLAS)/include/ -I$(COMBBLAS)/psort-1.0/include/ -I$(COMBBLAS)/usort/include/ -I$(COMBBLAS)/graph500-1.2/generator/include/ -I$(HYSORTK)/include
+
 
 UNAME_S:=$(shell uname -s)
 
@@ -63,8 +67,9 @@ test: elba
 	./runtests.sh
 
 elba: obj/main.o $(OBJECTS)
+	$(MAKE) -C $(HYSORTK) EXT=1 K=$(K) L=$(L) U=$(U) LOG=1 D=$(D) M=$$(( ($(K) / 4) * 2 + 1 ))
 	@echo CXX -c -o $@ $^
-	@$(COMPILER) $(FLAGS) $(INCADD) -o $@ $^ $(MPICH_FLAGS) -lz
+	@$(COMPILER) $(FLAGS) $(INCADD) -o $@ $^ $(HYSORTK)/obj/libhysortk.o $(MPICH_FLAGS) -lz
 
 obj/%.o: src/%.cpp
 	@mkdir -p $(@D)
@@ -101,6 +106,7 @@ obj/MPIOp.o: $(COMBBLAS_SRC)/MPIOp.cpp $(COMBBLAS_INC)/MPIOp.h
 	@$(COMPILER) $(FLAGS) $(INCADD) -c -o $@ $<
 
 clean:
+	$(MAKE) -C $(HYSORTK) clean
 	rm -rf *.o obj/*.o *.dSYM *.out *.mtx $(HOME)/bin/elba elba
 
 gitclean: clean

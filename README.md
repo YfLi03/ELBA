@@ -11,61 +11,68 @@
     
 2. GCC/G++ version 8.2.0 or above.
 
-3. CMake 3.11 or above.
+3. Make
 
-## Dependencies
-    
-0. STILL NEED TO EDIT THIS, WILL BE INCONSISTENT WITH ACTUAL REPO FOR A BIT.
+# Build and Run ELBA
 
-1. CombBLAS.
-  * Download or clone CombBLAS from `https://github.com/PASSIONLab/CombBLAS.git`.
-  * Export the path to this directory as an environment variable `COMBBLAS_HOME`.
-   ```
-      git clone https://github.com/PASSIONLab/CombBLAS.git
-      export COMBBLAS_HOME=$PWD
-   ```
-  * The following commands can be used to build and install CombBLAS:
-  ```
-    cd $COMBBLAS_HOME/CombBLAS
-    mkdir build
-    mkdir install
-    cd build
-    cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=../install ../
-    make -j4
-    make install         
-  ```
-3. SeqAn (included in this repository).
-  * Create an environment variable, `SEQAN_HOME`, pointing to it:
-  ```
-    export SEQAN_HOME=/path/to/seqan
-    export BLOOM_HOME=src/libbloom/
-  ```
-  * This is a header only library, so there's no need to build it.
+To use ELBA on perlmutter, follow these steps:
 
-# Build ELBA
-To build ELBA, you can use the following commands:
-  ```
-    mkdir build_release
-    cd build_release
-    cmake ..
-    make -j4  
-  ```
-Default macro definition in CMakeFiles.txt:
-  ```
-    #define MAX_KMER_SIZE  32
-    #define LOWER_KMER_FREQ 2
-    #define UPPER_KMER_FREQ 8
-  ```
-Based on the dataset, one might want to change the above definitions. **UPPER_KMER_FREQ**: reliable k-mer upper bound (8 works for E. coli (Sample) 30X and 4 for Human 10X and C. elegans 40X that you can find [here](https://portal.nersc.gov/project/m1982/dibella.2d/inputs/)), **LOWER_KMER_FREQ**: reliable k-mer lower bound.
+    * Download prerequisites:
 
-You can change the defaul setting at compile time when building using the following command instead of ```cmake ..```:
-```
-cmake -DLOWER_KMER_FREQ=<new-lower-bound> -DUPPER_KMER_FREQ=<new-upper-bound> .. 
-```
+        $> git clone https://github.com/PASSIONLab/ELBA . && cd ELBA
+        $> git clone https://github.com/PASSIONLab/CombBLAS
+        $> git clone https://github.com/CornellHPC/HySortK.git
 
-# Run ELBA
+    * Load compiler:
 
-You can run ELBA in parallel by specifying the number of processes to the mpirun or mpiexec command. The number of processes must be perfect square value.
+        $> module load PrgEnv-gnu
+
+    * In order to compile ELBA, you have to provide the k-mer size, lower, and upper frequency
+      bounds as inputs. For example, if the k-mer size was 31, the lower frequency bound 15,
+      and upper frequency bound 35, you would do the following:
+
+        $> make K=31 L=15 U=35 -j8
+
+    * The executable is named "elba" and is found in the ELBA directory.
+
+    * To run ELBA on a FASTA dataset named "reads.fa", first index the file with
+      the command:
+        $> module load spack
+        $> spack load samtools
+        $> samtools faidx reads.fa
+
+      ELBA will crash if the input FASTA is not indexed. You may need to run the following
+      command prior to loading spack:
+        $> module load cpu
+
+      which will disable the gpu module. However, remember to reload the gpu module before
+      running elba binary, or an error may occur during runtime.
+
+    * ELBA must be run with a square number of processors. Suppose we want to run ELBA
+      with 64 MPI tasks on a single perlmutter node. The slurm command would then be
+
+        $> srun -N 1 -n 64 -c 2 --cpu_bind=cores ./elba reads.fa
+
+    * Each perlmutter node has 128 cores to which we can bind each MPI tasks. Here are
+      some further examples of valid slurm commands for ELBA:
+
+        # 4 MPI tasks
+        $> srun -N 1 -n 4 --cpu_bind=cores ./elba reads.fa
+
+        # 1024 MPI tasks
+        $> srun -N 8 -n 1024 -c 2 --cpu_bind=cores ./elba reads.fa
+
+       etc.
+
+    * ELBA can also take further input parameters as follows:
+
+        Usage: elba [options] <reads.fa>
+        Options: -x INT   x-drop alignment threshold [15]
+                 -A INT   matching score [1]
+                 -B INT   mismatch penalty [1]
+                 -G INT   gap penalty [1]
+                 -o STR   output file name prefix "elba"
+                 -h       help message
 
 ## Input data samples
 A few input data sets can be downloaded [here](https://portal.nersc.gov/project/m1982/dibella.2d/inputs/). If you have your own FASTQs, you can convert them into FASTAs using [seqtk](https://github.com/lh3/seqtk):
